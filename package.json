@@ -1,0 +1,21 @@
+{
+  "name": "tinky-vision-mcp",
+  "version": "0.1.0",
+  "description": "MCP bridge for controlling legacy macOS apps via vision + accessibility. Lets Claude Desktop / Claude Code / any MCP client see + click + type in any app that doesn't natively speak MCP.",
+  "type": "module",
+  "bin": {
+    "tinky-vision-mcp": "./src/server.mjs"
+  },
+  "scripts": {
+    "build:helper": "cd swift-helper && swift build -c release && cp .build/release/tinky-os ../bin/tinky-os",
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "files": ["src/", "bin/", "README.md"]
+}

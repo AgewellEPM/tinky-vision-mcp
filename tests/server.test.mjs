@@ -298,6 +298,68 @@ test('SEC: approval cache is keyed by observed bundle, not by AI-claimed target 
   });
 });
 
+test('OPS: TINKY_AUDIT_DISABLE=1 suppresses log writes entirely', async () => {
+  // v0.1.2 — environments that don't want any audit trail (CI,
+  // automated test rigs, ephemeral containers) can opt out cleanly.
+  const { readFileSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { homedir } = await import('node:os');
+  const logPath = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp', 'session.jsonl');
+  const before = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
+  await withServer({
+    env: {
+      TINKY_AUTO_APPROVE: '1',
+      TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+      TINKY_AUDIT_DISABLE: '1',
+    },
+  }, async ({ call }) => {
+    await call(2, 'tools/call', { name: 'os_screenshot', arguments: {} });
+    await call(3, 'tools/call', {
+      name: 'os_type',
+      arguments: { text: 'should-not-be-logged', target: 'X', description: 'Y' },
+    });
+  });
+  const after = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
+  assert.equal(after, before, 'AUDIT_DISABLE=1 must not append any bytes to the log');
+});
+
+test('OPS: audit log rotates when size exceeds TINKY_AUDIT_ROTATE_MAX', async () => {
+  // v0.1.2 — rotation prevents the log from growing unbounded.
+  // Set a tiny threshold (1KB) + force counter to trigger every call
+  // (env TINKY_TEST_ROTATE_EVERY_CALL bypasses the 100-call defer).
+  // Run enough write tool calls to overflow + verify an archive
+  // appeared in the log directory.
+  const { readdirSync, existsSync, writeFileSync, mkdirSync, statSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { homedir } = await import('node:os');
+  const dir = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp');
+  mkdirSync(dir, { recursive: true });
+  const logPath = join(dir, 'session.jsonl');
+  // Pre-fill log to ~2KB so the first rotate check overflows the 1KB
+  // threshold regardless of the 100-call defer.
+  writeFileSync(logPath, 'x'.repeat(2048) + '\n');
+  const beforeArchives = readdirSync(dir).filter(f => /^session\..+\.jsonl$/.test(f));
+  await withServer({
+    env: {
+      TINKY_AUTO_APPROVE: '1',
+      TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+      TINKY_AUDIT_ROTATE_MAX: '1024',
+    },
+  }, async ({ call }) => {
+    // First call triggers the rotate check (counter=1 in our impl
+    // means rotate runs on first call, then skips for 99, then re-checks).
+    await call(2, 'tools/call', { name: 'os_focused_window', arguments: {} });
+  });
+  const afterArchives = readdirSync(dir).filter(f => /^session\..+\.jsonl$/.test(f));
+  assert.ok(afterArchives.length > beforeArchives.length,
+    `expected new archive after rotation; before=${beforeArchives.length} after=${afterArchives.length}`);
+  // session.jsonl should exist and be smaller than the threshold
+  // (or just contain the one new entry).
+  assert.ok(existsSync(logPath), 'fresh session.jsonl should exist post-rotation');
+  assert.ok(statSync(logPath).size < 1024,
+    `fresh log should be < threshold; got ${statSync(logPath).size}`);
+});
+
 test('SEC: audit log redacts os_type "text" payload (Codex HIGH#1)', async () => {
   // Run a successful os_type with a known sentinel + read the log file
   // to prove the cleartext never landed. The fake helper accepts

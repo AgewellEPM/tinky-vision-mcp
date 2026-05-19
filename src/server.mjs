@@ -46,14 +46,25 @@
 // passwords typed through the helper never land on disk in cleartext.
 // SECRET_ARG_KEYS extends the redaction set for future tools.
 //
-// LABEL: v0.1.1 — PILOT-READY for vision + non-sensitive automation.
-// 13/13 tests green (10 functional + 3 SEC regressions for the
-// 3 HIGH Codex findings closed in this release). Still needs signed
-// binary distribution + audit-log rotation + real-app hardware smoke
-// before PRODUCTION-READY.
+// v0.1.2: size-based log rotation. When session.jsonl exceeds
+// TINKY_AUDIT_ROTATE_MAX (default 5MB), it is renamed
+// session.<iso-ts>.jsonl and a fresh session.jsonl begins. Keeps the
+// last TINKY_AUDIT_KEEP_FILES archives (default 5), unlinks older.
+// TINKY_AUDIT_DISABLE=1 suppresses logging entirely (CI/ephemeral
+// runs). Rotation runs at most every 100 appends — one stat() per
+// ~100 tool calls is cheap, and off-by-N around the threshold is
+// harmless.
+//
+// LABEL: v0.1.2 — PILOT-READY for vision + non-sensitive automation.
+// 15/15 tests green (3 functional + 3 SEC regressions + 2 OPS rotation
+// + 7 detection). Still needs signed binary distribution + real-app
+// hardware smoke before PRODUCTION-READY.
 
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdirSync, appendFileSync, existsSync } from 'node:fs';
+import {
+  mkdirSync, appendFileSync, existsSync,
+  statSync, renameSync, readdirSync, unlinkSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -156,11 +167,52 @@ function redactArgsForAudit(toolName, args) {
   return out;
 }
 
+// v0.1.2 — size-based audit-log rotation. Without this the log grew
+// unbounded forever (every tool call appends 100-300 bytes; a busy
+// session can hit MBs). Rotate when LOG_FILE exceeds AUDIT_ROTATE_MAX
+// bytes: rename session.jsonl → session.<ts>.jsonl, start fresh.
+// Retain at most AUDIT_KEEP_FILES old archives; older ones unlink.
+// Both knobs are env-tunable so power users can dial size vs retention.
+const AUDIT_ROTATE_MAX = parseInt(process.env.TINKY_AUDIT_ROTATE_MAX, 10) || 5 * 1024 * 1024;
+const AUDIT_KEEP_FILES = parseInt(process.env.TINKY_AUDIT_KEEP_FILES, 10) || 5;
+const AUDIT_DISABLED   = process.env.TINKY_AUDIT_DISABLE === '1';
+
+function rotateIfNeeded() {
+  // Cheap check before EVERY append would be O(syscall). Defer to one
+  // size check per N appends via a counter (real cost: one stat per ~100
+  // tool calls). Off-by-one in either direction is harmless — we just
+  // rotate slightly before or slightly after the threshold.
+  rotateIfNeeded._counter = (rotateIfNeeded._counter || 0) + 1;
+  if (rotateIfNeeded._counter < 100 && rotateIfNeeded._counter > 1) return;
+  rotateIfNeeded._counter = 1;
+  try {
+    if (!existsSync(LOG_FILE)) return;
+    const sz = statSync(LOG_FILE).size;
+    if (sz < AUDIT_ROTATE_MAX) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archive = join(LOG_DIR, `session.${stamp}.jsonl`);
+    renameSync(LOG_FILE, archive);
+    // Trim retention: list session.*.jsonl, sort newest-first, drop
+    // beyond AUDIT_KEEP_FILES.
+    const archived = readdirSync(LOG_DIR)
+      .filter(f => /^session\..+\.jsonl$/.test(f))
+      .map(f => ({ f, p: join(LOG_DIR, f), m: statSync(join(LOG_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    for (const { p } of archived.slice(AUDIT_KEEP_FILES)) {
+      try { unlinkSync(p); } catch { /* silent */ }
+    }
+  } catch { /* silent — never let rotation break the write path */ }
+}
+
 function audit(entry) {
+  if (AUDIT_DISABLED) return;
   const safe = { ...entry };
   if (safe.args) safe.args = redactArgsForAudit(safe.tool, safe.args);
   const line = JSON.stringify({ ts: Date.now(), ...safe }) + '\n';
-  try { appendFileSync(LOG_FILE, line); } catch { /* silent */ }
+  try {
+    rotateIfNeeded();
+    appendFileSync(LOG_FILE, line);
+  } catch { /* silent */ }
 }
 
 // ────────────────────────── helper invocation ──────────────────────────
@@ -450,7 +502,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: 'tinky-vision-mcp',
-    version: '0.1.1',
+    version: '0.1.2',
   },
   {
     capabilities: { tools: {} },

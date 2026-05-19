@@ -4,6 +4,26 @@ All notable changes to **tinky-vision-mcp** are documented here. Format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
 
+## [0.1.2] — 2026-05-19
+
+### Added (operations)
+
+- **Audit-log rotation.** Previously `session.jsonl` grew unbounded
+  forever; a busy session would silently consume megabytes of disk
+  per day. Now rotates when the file exceeds `TINKY_AUDIT_ROTATE_MAX`
+  bytes (default 5MB) — renames to `session.<iso-ts>.jsonl` and starts
+  fresh. Keeps the last `TINKY_AUDIT_KEEP_FILES` archives (default 5).
+  Rotation runs at most every 100 appends so the size-check is cheap.
+- **`TINKY_AUDIT_DISABLE=1`** env var — suppresses all log writes for
+  CI / ephemeral / test rigs.
+- Two new tests (`tests/server.test.mjs`) covering both the rotation
+  threshold + the disable knob. Total: 13 → 15.
+
+### Changed
+
+- File-top docblock label bumped to v0.1.2 + rotation behavior
+  documented inline alongside the existing audit-redaction policy.
+
 ## [0.1.1] — 2026-05-19
 
 ### Security (3 HIGH + 1 MEDIUM findings closed)

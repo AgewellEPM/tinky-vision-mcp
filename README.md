@@ -1,8 +1,38 @@
 # tinky-vision-mcp
 
-**PROTOTYPE — do not run against production logins, banking, or
-1Password-style apps. This server can click anywhere and type
-anything. Treat it like sudo for your screen.**
+**v0.1.1 — PILOT-READY for vision + non-sensitive automation. Treat
+it like sudo for your screen.**
+
+This server CAN click anywhere and type anything on your Mac. Three
+hard gates run on every write action, in order, before anything
+moves:
+
+1. **Read-only mode** (`--read-only`) — disables all write tools
+2. **Sensitive-app deny-list** — hard policy block when 1Password,
+   Bitwarden, LastPass, Dashlane, Keychain, SecurityAgent, Touch-ID
+   prompt, Terminal, iTerm, Screen Sharing, or System Settings is the
+   focused app. **Fails closed**: if the helper can't identify focus
+   for any reason (helper crash, no app frontmost, etc.) the write is
+   blocked, not allowed. Cannot be opted past inside a session.
+3. **Per-(target × observed bundle) consent dialog** — first call per
+   pair pops a native macOS dialog. Approval is keyed on observed
+   bundle + AI-claimed target, so a Safari approval does NOT auto-
+   extend to a different app even if the agent reuses the same
+   `target` string.
+
+The audit log at `~/Library/Logs/tinky-vision-mcp/session.jsonl`
+records every call. `os_type` `text` payloads are redacted to
+`[REDACTED:Nch]` before write — passwords typed through the helper
+never land on disk in plaintext.
+
+These three layers + the audit redaction were added in v0.1.1 after
+a 4-round Codex security review. Run `npm test` to see the 13-test
+suite that locks them.
+
+**Still not in scope**: signed binary distribution, audit-log
+rotation, real-app hardware smoke. That's why this is PILOT-READY
+not PRODUCTION-READY. Don't run against accounts you can't afford to
+lose.
 
 Local [Model Context Protocol](https://modelcontextprotocol.io/) server
 that bridges modern AI clients (Claude Desktop, Claude Code, Cursor,

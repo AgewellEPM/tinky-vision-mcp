@@ -48,10 +48,49 @@ import {
 // ────────────────────────── config ──────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const HELPER_BIN = resolve(__dirname, '..', 'bin', 'tinky-os');
+// HELPER_BIN can be overridden via env for tests (fake helper script
+// that emits canned JSON). Default = the prebuilt Swift binary.
+const HELPER_BIN = process.env.TINKY_HELPER_BIN ||
+  resolve(__dirname, '..', 'bin', 'tinky-os');
 const LOG_DIR = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp');
 const LOG_FILE = join(LOG_DIR, 'session.jsonl');
 const READ_ONLY = process.argv.includes('--read-only');
+
+// AUTO_APPROVE bypasses the osascript dialog. Used by `npm test` and by
+// power users who explicitly want non-interactive use. Documented as a
+// foot-gun in the README. NEVER on by default.
+const AUTO_APPROVE = process.env.TINKY_AUTO_APPROVE === '1';
+
+// ────────────────────────── sensitive-app deny-list ──────────────────────────
+//
+// Hard block on write tools when the focused window belongs to a
+// password manager, the macOS Keychain, the auth prompt, or any custom
+// bundle the user added via TINKY_DENY_BUNDLES (colon-separated). This
+// is policy, not consent — the user cannot opt past it inside a
+// session. To allow a denied app, restart the server without the entry.
+//
+// Reasoning: a prompt-injected agent that can click + type inside
+// 1Password / Keychain / browser-banking can drain accounts in seconds.
+// The dialog gate is a speed bump; this is a wall.
+const DEFAULT_DENY = new Set([
+  'com.agilebits.onepassword7',         // 1Password 7
+  'com.1password.1password',            // 1Password 8 (App Store)
+  'com.1password.1password-launcher',
+  'com.bitwarden.desktop',
+  'com.lastpass.LastPassMacDesktop',
+  'com.dashlane.dashlanephonefinal',
+  'com.apple.keychainaccess',
+  'com.apple.SecurityAgent',            // OS auth prompt
+  'com.apple.LocalAuthentication.UIAgent', // Touch-ID / biometric prompt
+  'com.apple.systempreferences',        // System Settings — too easy to wreck
+  'com.apple.Terminal',                 // foot-gun: agent typing into terminal
+  'com.googlecode.iterm2',
+  'com.apple.ScreenSharing',
+  'com.apple.security.pboxd',
+]);
+const EXTRA_DENY = (process.env.TINKY_DENY_BUNDLES || '')
+  .split(':').map(s => s.trim()).filter(Boolean);
+const DENY_BUNDLES = new Set([...DEFAULT_DENY, ...EXTRA_DENY]);
 
 if (!existsSync(HELPER_BIN)) {
   console.error(
@@ -103,15 +142,54 @@ function callHelper(subcmd, args = []) {
 /// every new Claude conversation re-prompts.
 const approvedTargets = new Set();
 
+/// Look up the currently focused app's bundle ID. Returns null if no
+/// app is frontmost or the helper call fails — callers should treat
+/// null as "unknown, fail closed" for the deny-list.
+function focusedBundleID() {
+  try {
+    const r = callHelper('focused-window');
+    return r?.focused?.bundleID || null;
+  } catch {
+    return null;
+  }
+}
+
+/// Hard deny-list enforcement. Throws an Error (which becomes a tool
+/// error, not a server crash) when the focused app is sensitive. Run
+/// BEFORE the consent dialog so the user never sees a "click in
+/// 1Password?" prompt — that prompt would teach them to approve.
+function enforceDenyList(toolName) {
+  const bundle = focusedBundleID();
+  if (bundle && DENY_BUNDLES.has(bundle)) {
+    audit({ tool: toolName, deny: true, focused: bundle });
+    throw new Error(
+      `DENIED: focused app ${bundle} is on the sensitive-app deny-list. ` +
+      `Write tools (click/type/key) are blocked when these apps are frontmost. ` +
+      `Switch focus to a non-sensitive app and retry, or restart the server ` +
+      `with TINKY_DENY_BUNDLES set to remove the entry (not recommended).`
+    );
+  }
+  return bundle;
+}
+
 /// Ask the user via /usr/bin/osascript for permission to perform a
 /// write action against `target`. Returns true on yes, false on no.
 /// `description` is a short human-readable summary of what the AI
-/// wants to do, shown verbatim in the dialog.
-function requestConsent(target, description) {
+/// wants to do, shown verbatim in the dialog. Includes the OBSERVED
+/// focused-app bundle so a mismatch between AI-claimed target and
+/// reality is visible to the user.
+function requestConsent(target, description, observedBundle = null) {
   if (READ_ONLY) return false;
+  if (AUTO_APPROVE) return true;
   if (approvedTargets.has(target)) return true;
   const title = 'Tinky Vision MCP — Action approval';
-  const detail = `Claude wants to perform an OS-level action:\n\n${description}\n\nTarget: ${target}\n\nApprove this and future actions against this target for the current session?`;
+  const observed = observedBundle
+    ? `\n\nObserved focused app: ${observedBundle}`
+    : '';
+  const detail =
+    `Claude wants to perform an OS-level action:\n\n${description}` +
+    `\n\nTarget: ${target}${observed}` +
+    `\n\nApprove this and future actions against this target for the current session?`;
   const script = `
     set theResponse to display dialog ${JSON.stringify(detail)} with title ${JSON.stringify(title)} buttons {"Deny", "Approve once", "Approve session"} default button "Deny" with icon caution
     set btn to button returned of theResponse
@@ -131,6 +209,18 @@ function requestConsent(target, description) {
   } catch {
     return false;
   }
+}
+
+/// Shared guard for every write tool. Runs read-only check, deny-list,
+/// consent, in that order. Returns the observed bundle on success;
+/// throws on any block.
+function guardedWrite(toolName, target, description) {
+  if (READ_ONLY) throw new Error('Write tools disabled (--read-only).');
+  const observedBundle = enforceDenyList(toolName);
+  if (!requestConsent(target, description, observedBundle)) {
+    throw new Error(`User denied consent for ${toolName}.`);
+  }
+  return observedBundle;
 }
 
 // ────────────────────────── tool defs ──────────────────────────
@@ -232,6 +322,28 @@ const TOOLS = [
     description: 'Check whether the tinky-os helper has Accessibility permission. Returns { accessibility: true|false }. Call this first if click/type/key are failing — without Accessibility, they silently no-op at the OS level.',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'os_focused_window',
+    description: 'Report the currently frontmost app and its key window. Returns { focused: { bundleID, name, pid, window: { windowID, title, bounds } } } or null. Use this to verify which app a click will land in BEFORE calling os_click — also used internally by the deny-list to block writes against password managers / Keychain / SecurityAgent.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'vision_find_text',
+    description: 'Run on-device OCR over the current screen (or a provided PNG) and return text matches with bounding boxes. Returns `image_px` (pixel coords inside the image) and `screen_pt` (point coords for os_click, null on multi-monitor). Use this to LOCATE clickable text like "Play", "Sign in", "OK" without guessing pixel coords. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Optional case-insensitive substring filter. Omit to get all detected text on screen.',
+        },
+        inPath: {
+          type: 'string',
+          description: 'Optional path to an existing PNG to OCR instead of capturing the screen. Useful for re-analyzing a previous os_screenshot.',
+        },
+      },
+    },
+  },
 ];
 
 // ────────────────────────── server ──────────────────────────
@@ -270,29 +382,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         result = callHelper('find-window', ['--query', args.query ?? '']);
         break;
       case 'os_click': {
-        if (READ_ONLY) throw new Error('Write tools disabled (--read-only).');
-        if (!requestConsent(args.target, `os_click(x=${args.x}, y=${args.y}${args.double ? ', double' : ''}): ${args.description}`)) {
-          throw new Error('User denied consent for os_click.');
-        }
+        guardedWrite('os_click', args.target,
+          `os_click(x=${args.x}, y=${args.y}${args.double ? ', double' : ''}): ${args.description}`);
         const argv = ['--x', String(args.x), '--y', String(args.y)];
         if (args.double) argv.push('--double');
         result = callHelper('click', argv);
         break;
       }
       case 'os_type': {
-        if (READ_ONLY) throw new Error('Write tools disabled (--read-only).');
-        if (!requestConsent(args.target, `os_type(${args.text.length} chars): ${args.description}`)) {
-          throw new Error('User denied consent for os_type.');
-        }
+        guardedWrite('os_type', args.target,
+          `os_type(${String(args.text || '').length} chars): ${args.description}`);
         result = callHelper('type', ['--text', String(args.text)]);
         break;
       }
       case 'os_key': {
-        if (READ_ONLY) throw new Error('Write tools disabled (--read-only).');
         const mods = ['cmd','shift','opt','ctrl'].filter(m => args[m]).join('+');
-        if (!requestConsent(args.target, `os_key(${mods ? mods + '+' : ''}${args.key}): ${args.description}`)) {
-          throw new Error('User denied consent for os_key.');
-        }
+        guardedWrite('os_key', args.target,
+          `os_key(${mods ? mods + '+' : ''}${args.key}): ${args.description}`);
         const argv = ['--key', String(args.key)];
         for (const m of ['cmd','shift','opt','ctrl']) if (args[m]) argv.push(`--${m}`);
         result = callHelper('key', argv);
@@ -305,6 +411,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         try { result = callHelper('ax-check'); }
         catch (e) { result = { ok: true, accessibility: false }; }
         break;
+      case 'os_focused_window':
+        result = callHelper('focused-window');
+        break;
+      case 'vision_find_text': {
+        const argv = [];
+        if (args.query)  argv.push('--query', String(args.query));
+        if (args.inPath) argv.push('--in', String(args.inPath));
+        result = callHelper('find-text', argv);
+        break;
+      }
       default:
         throw new Error(`Unknown tool: ${name}`);
     }

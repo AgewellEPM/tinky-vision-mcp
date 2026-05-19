@@ -32,24 +32,36 @@ fast human moving the mouse and typing on the keyboard.
 | `os_screenshot` | read-only | PNG of screen or specific app window |
 | `os_list_apps` | read-only | All running regular `.app` processes with bundle IDs |
 | `os_find_window` | read-only | Search visible windows by title/owner substring |
+| `os_focused_window` | read-only | Frontmost app's bundle ID + key-window bounds |
+| `vision_find_text` | read-only | On-device OCR (macOS Vision) over the screen; returns text + clickable coords |
 | `os_ax_check` | read-only | Is Accessibility permission granted? |
 | `os_click` | **write** | Synthetic mouse click at screen coords |
 | `os_type` | **write** | Type text at currently-focused field |
 | `os_key` | **write** | Press a key with optional Cmd/Shift/Opt/Ctrl |
 
-Every write tool requires:
-1. Accessibility permission for the `tinky-os` helper binary
-2. An OS-level consent dialog on first call per target app per session
-3. A `target` + `description` argument so the user sees what's being
-   approved before approving it
+Every write tool runs through three gates, in order:
+1. **Read-only check** — server started with `--read-only` blocks all writes
+2. **Sensitive-app deny-list** — hard policy block when the focused window
+   belongs to 1Password / Bitwarden / LastPass / Dashlane / Keychain /
+   SecurityAgent / Touch-ID prompt / Terminal / iTerm / Screen Sharing /
+   System Settings. Cannot be opted past inside a session. Extend via the
+   `TINKY_DENY_BUNDLES` env var (colon-separated).
+3. **Consent dialog** — first call per `target` per session pops a native
+   macOS dialog showing the AI's described action AND the observed
+   focused-app bundle (so target/reality mismatches are visible).
+
+The deny-list is intentionally stricter than the consent prompt because
+prompt-injection attacks teach AIs to lie about what they're doing.
+Policy blocks the action before the dialog ever shows.
 
 ## Install
 
 ```bash
-git clone https://github.com/<you>/tinky-vision-mcp.git
+git clone https://github.com/AgewellEPM/tinky-vision-mcp.git
 cd tinky-vision-mcp
 npm install
 npm run build:helper   # builds the Swift CLI + copies to bin/
+npm test               # run the 10-test policy + integration suite
 ```
 
 ### Grant Accessibility to the helper

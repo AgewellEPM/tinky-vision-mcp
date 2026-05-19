@@ -34,6 +34,8 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Vision
+import ImageIO
 
 // MARK: - JSON helpers
 
@@ -345,6 +347,168 @@ func cmdFindWindow(_ args: Args) {
     jsonOut(["ok": true, "windows": matches])
 }
 
+// MARK: - Focused window
+//
+// Returns the bundle ID + visible bounds of the frontmost regular app's
+// key window. The MCP host uses this to enforce a deny-list (do not
+// click/type when 1Password / Keychain / SecurityAgent / bank-tab is the
+// active target). Read-only; no AX gate required for the basic case.
+
+func cmdFocusedWindow(_ args: Args) {
+    guard let app = NSWorkspace.shared.frontmostApplication else {
+        jsonOut(["ok": true, "focused": NSNull()])
+        return
+    }
+    let bundleID = app.bundleIdentifier ?? ""
+    let name = app.localizedName ?? ""
+    let pid = app.processIdentifier
+
+    // Find that app's topmost on-screen window (layer 0 = standard).
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    var winInfo: [String: Any] = [:]
+    if let arr = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] {
+        for w in arr {
+            if let wpid = w[kCGWindowOwnerPID as String] as? Int32, wpid == pid,
+               let layer = w[kCGWindowLayer as String] as? Int, layer == 0 {
+                winInfo = [
+                    "windowID": (w[kCGWindowNumber as String] as? Int) ?? 0,
+                    "title": (w[kCGWindowName as String] as? String) ?? "",
+                    "bounds": (w[kCGWindowBounds as String] as? [String: Any]) ?? [:],
+                ]
+                break
+            }
+        }
+    }
+    jsonOut([
+        "ok": true,
+        "focused": [
+            "bundleID": bundleID,
+            "name": name,
+            "pid": Int(pid),
+            "window": winInfo,
+        ],
+    ])
+}
+
+// MARK: - OCR (find-text)
+//
+// Captures a screenshot of the whole main screen (or an existing image
+// file when --in is provided), runs Vision's text recognizer, returns
+// bounding boxes in BOTH image-pixel coords AND screen-point coords so
+// the MCP server can feed them straight to `click_at`.
+//
+// Single-screen assumption is documented — multi-monitor falls back to
+// image-pixel coords only (screen_x/y == null). Good enough for the
+// pilot; explicit so the host can decide what to do.
+
+func cmdFindText(_ args: Args) {
+    // Acquire a CGImage to OCR. Two paths:
+    //   --in <png>  → load from disk (testable + lets us OCR app-only shots)
+    //   default     → capture full main screen now via screencapture
+    let imagePath: String
+    if let p = args.opts["in"] {
+        imagePath = p
+    } else {
+        let outPath = defaultScreenshotPath()
+        let task = Process()
+        task.launchPath = "/usr/sbin/screencapture"
+        task.arguments = ["-x", outPath]
+        do {
+            try task.run(); task.waitUntilExit()
+            if task.terminationStatus != 0 { jsonErr("screencapture exited \(task.terminationStatus)") }
+        } catch { jsonErr("screencapture failed: \(error.localizedDescription)") }
+        imagePath = outPath
+    }
+
+    guard let url = URL(string: "file://\(imagePath)"),
+          let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        jsonErr("Could not load image at \(imagePath)")
+    }
+    let imgW = CGFloat(cg.width)
+    let imgH = CGFloat(cg.height)
+
+    // Set up Vision request synchronously; recognitionLevel = accurate is
+    // ~250ms per shot on M1, worth the latency for the agent loop. Add
+    // a query-driven recognition language hint if available.
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    if #available(macOS 13.0, *) {
+        request.recognitionLanguages = ["en-US"]
+    }
+
+    let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+    do { try handler.perform([request]) }
+    catch { jsonErr("Vision OCR failed: \(error.localizedDescription)") }
+
+    let observations = (request.results ?? [])
+    let queryRaw = args.opts["query"] ?? ""
+    let query = queryRaw.lowercased()
+
+    // For screen-coord conversion: assume main display, derive scale
+    // from image px / NSScreen points. Multi-monitor → returns null.
+    var screenScale: CGFloat? = nil
+    if let screen = NSScreen.main {
+        let pts = screen.frame.size
+        // If image dims look like an integer multiple of the screen's
+        // point size we can trust the conversion. Otherwise leave null
+        // and let the host handle pixel coords.
+        let scaleX = imgW / pts.width
+        let scaleY = imgH / pts.height
+        if abs(scaleX - scaleY) < 0.05 { screenScale = scaleX }
+    }
+
+    var matches: [[String: Any]] = []
+    for obs in observations {
+        guard let top = obs.topCandidates(1).first else { continue }
+        let text = top.string
+        if !query.isEmpty && !text.lowercased().contains(query) { continue }
+
+        // Vision bbox: normalized 0-1, origin BOTTOM-LEFT.
+        let bb = obs.boundingBox
+        let pxX = bb.minX * imgW
+        let pxY = (1.0 - bb.maxY) * imgH          // flip Y to top-origin
+        let pxW = bb.width * imgW
+        let pxH = bb.height * imgH
+        let pxCx = pxX + pxW / 2
+        let pxCy = pxY + pxH / 2
+
+        var entry: [String: Any] = [
+            "text": text,
+            "confidence": Double(top.confidence),
+            "image_px": [
+                "x": Int(pxX), "y": Int(pxY),
+                "w": Int(pxW), "h": Int(pxH),
+                "cx": Int(pxCx), "cy": Int(pxCy),
+            ],
+        ]
+        if let s = screenScale, s > 0 {
+            entry["screen_pt"] = [
+                "x": Int(pxX / s), "y": Int(pxY / s),
+                "w": Int(pxW / s), "h": Int(pxH / s),
+                "cx": Int(pxCx / s), "cy": Int(pxCy / s),
+            ]
+        } else {
+            entry["screen_pt"] = NSNull()
+        }
+        matches.append(entry)
+    }
+
+    jsonOut([
+        "ok": true,
+        "image": [
+            "path": imagePath,
+            "width_px": Int(imgW),
+            "height_px": Int(imgH),
+            "screen_scale": screenScale.map { Double($0) } as Any,
+        ],
+        "query": queryRaw,
+        "matches": matches,
+        "match_count": matches.count,
+    ])
+}
+
 // MARK: - AX check
 
 func cmdAXCheck(_ args: Args) {
@@ -361,9 +525,11 @@ case "screenshot":   cmdScreenshot(args)
 case "click":        cmdClick(args)
 case "type":         cmdType(args)
 case "key":          cmdKey(args)
-case "apps":         cmdApps(args)
-case "find-window":  cmdFindWindow(args)
-case "ax-check":     cmdAXCheck(args)
+case "apps":           cmdApps(args)
+case "find-window":    cmdFindWindow(args)
+case "focused-window": cmdFocusedWindow(args)
+case "find-text":      cmdFindText(args)
+case "ax-check":       cmdAXCheck(args)
 case "help", "--help", "-h":
     print("""
     tinky-os — macOS primitives for the Tinky Vision MCP bridge.
@@ -375,6 +541,8 @@ case "help", "--help", "-h":
       key --key <name> [--cmd] [--shift] [--opt] [--ctrl]
       apps
       find-window --query "<substring>"
+      focused-window
+      find-text [--query "<substring>"] [--in <png>]
       ax-check
     """)
 default:

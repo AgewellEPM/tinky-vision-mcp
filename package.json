@@ -8,7 +8,8 @@
   },
   "scripts": {
     "build:helper": "cd swift-helper && swift build -c release && cp .build/release/tinky-os ../bin/tinky-os",
-    "start": "node src/server.mjs"
+    "start": "node src/server.mjs",
+    "test": "node --test tests/server.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

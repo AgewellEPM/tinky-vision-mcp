@@ -14,23 +14,43 @@
 //                                                                       ▼
 //                                                                  CGEvent / AX / screencapture
 //
-// Tools exposed (all macOS-host-only):
-//   - os_screenshot         capture screen or app window
-//   - os_list_apps          enumerate running regular .app processes
-//   - os_find_window        search visible windows by title/owner
-//   - os_click              mouse click at screen coords
-//   - os_type               type text at focused field
-//   - os_key                press a key with optional modifiers
-//   - os_ax_check           report Accessibility permission state
+// Tools exposed (9 total, all macOS-host-only):
+//   read-only:
+//     os_screenshot        capture screen or app window
+//     os_list_apps         enumerate running regular .app processes
+//     os_find_window       search visible windows by title/owner
+//     os_focused_window    report the frontmost app + key window
+//     vision_find_text     on-device OCR (Vision framework) → text + coords
+//     os_ax_check          report Accessibility permission state
+//   write (gated):
+//     os_click             mouse click at screen coords
+//     os_type              type text at focused field
+//     os_key               press a key with optional modifiers
 //
-// Security gate:
-//   - Every WRITE tool (click/type/key) requires an OS-level approval
-//     dialog on first call per target app per session, then auto-
-//     allows for that app until the server restarts.
-//   - Every call appended to ~/Library/Logs/tinky-vision-mcp/session.jsonl
-//   - --read-only flag disables write tools entirely.
+// Security gate (every WRITE tool, in order):
+//   1. Read-only check       — `--read-only` blocks all writes
+//   2. Sensitive-app deny-list — hard policy block when 1Password /
+//      Bitwarden / LastPass / Dashlane / Keychain / SecurityAgent /
+//      Touch-ID / Terminal / iTerm / Screen Sharing / System Settings
+//      is focused. FAILS CLOSED: if focused-window helper can't
+//      identify focus (helper crash, no app frontmost), write is
+//      blocked. Cannot be opted past in-session. Extend via
+//      TINKY_DENY_BUNDLES env (colon-separated).
+//   3. Consent dialog — keyed on (observed bundle × AI-claimed
+//      target). "Approve session" remembers ONLY that exact pair;
+//      a different bundle re-prompts. AUTO_APPROVE env bypasses
+//      the dialog (testing only, NEVER on by default).
 //
-// LABEL: PROTOTYPE.
+// Audit log at ~/Library/Logs/tinky-vision-mcp/session.jsonl. os_type
+// `text` payloads are redacted to `[REDACTED:Nch]` before write —
+// passwords typed through the helper never land on disk in cleartext.
+// SECRET_ARG_KEYS extends the redaction set for future tools.
+//
+// LABEL: v0.1.1 — PILOT-READY for vision + non-sensitive automation.
+// 13/13 tests green (10 functional + 3 SEC regressions for the
+// 3 HIGH Codex findings closed in this release). Still needs signed
+// binary distribution + audit-log rotation + real-app hardware smoke
+// before PRODUCTION-READY.
 
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, appendFileSync, existsSync } from 'node:fs';

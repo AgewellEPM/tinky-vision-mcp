@@ -103,9 +103,43 @@ if (!existsSync(HELPER_BIN)) {
 mkdirSync(LOG_DIR, { recursive: true });
 
 // ────────────────────────── audit log ──────────────────────────
+//
+// The audit log lives at ~/Library/Logs/tinky-vision-mcp/session.jsonl.
+// It records EVERY tool call so Luke can prove (or disprove) what an
+// agent did during a session. Because the helper types real keystrokes,
+// the raw `text` argument of os_type can contain passwords, MFA codes,
+// API tokens, etc. Codex finding HIGH#1 (2026-05-18): persisting that
+// payload to a plaintext on-disk log is a local credential leak even
+// without anyone breaching the box — Time-Machine, search-indexer, and
+// cloud-backed Library backups will silently propagate it.
+//
+// Policy:
+//   - For os_type:    drop `text` entirely; keep only length.
+//   - For os_click/key: keep coords/key/mods; description+target are
+//                       user-authored labels and safe to keep.
+//   - For read tools: pass-through (no secrets in their args).
+//
+// If a future tool accepts secrets, add it to SECRET_ARG_KEYS so the
+// redactor wipes them without us having to remember to do it manually.
+const SECRET_ARG_KEYS = new Set(['text', 'password', 'token', 'secret', 'apiKey']);
+
+function redactArgsForAudit(toolName, args) {
+  if (!args || typeof args !== 'object') return args;
+  const out = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (SECRET_ARG_KEYS.has(k) && typeof v === 'string') {
+      out[k] = `[REDACTED:${v.length}ch]`;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
 
 function audit(entry) {
-  const line = JSON.stringify({ ts: Date.now(), ...entry }) + '\n';
+  const safe = { ...entry };
+  if (safe.args) safe.args = redactArgsForAudit(safe.tool, safe.args);
+  const line = JSON.stringify({ ts: Date.now(), ...safe }) + '\n';
   try { appendFileSync(LOG_FILE, line); } catch { /* silent */ }
 }
 
@@ -137,39 +171,72 @@ function callHelper(subcmd, args = []) {
 
 // ────────────────────────── consent gate ──────────────────────────
 
-/// In-memory per-session allow list of target apps the user has
-/// already approved for write actions. Cleared on server restart so
-/// every new Claude conversation re-prompts.
+/// In-memory per-session allow list of approved (target, bundleID)
+/// pairs the user has already approved for write actions. Cleared on
+/// server restart so every new Claude conversation re-prompts.
+///
+/// Codex finding HIGH#3 (2026-05-18): keying approvals on the caller-
+/// supplied `target` string alone let a prompt-injected agent reuse a
+/// prior approval (e.g. "Safari") even after focus had silently moved
+/// to 1Password / a banking tab / a different app. Now we key on the
+/// OBSERVED focused-app bundle joined with the user-claimed target so
+/// the cache only matches when reality and claim still agree.
 const approvedTargets = new Set();
+function approvalKey(target, bundleID) {
+  return `${bundleID || '<unknown>'}::${target || '<none>'}`;
+}
 
-/// Look up the currently focused app's bundle ID. Returns null if no
-/// app is frontmost or the helper call fails — callers should treat
-/// null as "unknown, fail closed" for the deny-list.
+/// Look up the currently focused app's bundle ID.
+///
+/// Returns:
+///   { bundleID: 'com.example.app' }  on success
+///   { error: 'reason' }              on helper failure OR no focused app
+///
+/// We deliberately do NOT collapse "helper failed" and "no focused
+/// window" into the same `null` return that callers might misread as
+/// "safe to proceed" (Codex finding HIGH#2 — the previous version did
+/// exactly that and the deny-list silently fell through).
 function focusedBundleID() {
   try {
     const r = callHelper('focused-window');
-    return r?.focused?.bundleID || null;
-  } catch {
-    return null;
+    const id = r?.focused?.bundleID;
+    if (id) return { bundleID: id };
+    return { error: 'no focused app reported by helper' };
+  } catch (e) {
+    return { error: e?.message || 'focused-window helper call failed' };
   }
 }
 
-/// Hard deny-list enforcement. Throws an Error (which becomes a tool
-/// error, not a server crash) when the focused app is sensitive. Run
-/// BEFORE the consent dialog so the user never sees a "click in
-/// 1Password?" prompt — that prompt would teach them to approve.
+/// Hard deny-list enforcement. Throws on (a) helper failure, (b) no
+/// focused app, or (c) focused app present in the deny-list. Run BEFORE
+/// the consent dialog so the user never sees a "click in 1Password?"
+/// prompt — that prompt would teach them to approve.
+///
+/// Fail-closed semantics (Codex HIGH#2): if we can't be certain the
+/// focused app is safe, we block. The cost of a false-positive block
+/// is "retry in 2 seconds"; the cost of a false-negative allow is
+/// "agent typed your master password into a notes app".
 function enforceDenyList(toolName) {
-  const bundle = focusedBundleID();
-  if (bundle && DENY_BUNDLES.has(bundle)) {
-    audit({ tool: toolName, deny: true, focused: bundle });
+  const { bundleID, error } = focusedBundleID();
+  if (error) {
+    audit({ tool: toolName, deny: true, reason: 'focus-unknown', detail: error });
     throw new Error(
-      `DENIED: focused app ${bundle} is on the sensitive-app deny-list. ` +
+      `DENIED: cannot identify the currently focused app (${error}). ` +
+      `Write tools are blocked when focus is uncertain because we cannot ` +
+      `verify the target is not a password manager or auth prompt. ` +
+      `Bring a regular app to the foreground (click into it) and retry.`
+    );
+  }
+  if (DENY_BUNDLES.has(bundleID)) {
+    audit({ tool: toolName, deny: true, focused: bundleID });
+    throw new Error(
+      `DENIED: focused app ${bundleID} is on the sensitive-app deny-list. ` +
       `Write tools (click/type/key) are blocked when these apps are frontmost. ` +
       `Switch focus to a non-sensitive app and retry, or restart the server ` +
       `with TINKY_DENY_BUNDLES set to remove the entry (not recommended).`
     );
   }
-  return bundle;
+  return bundleID;
 }
 
 /// Ask the user via /usr/bin/osascript for permission to perform a
@@ -178,18 +245,30 @@ function enforceDenyList(toolName) {
 /// wants to do, shown verbatim in the dialog. Includes the OBSERVED
 /// focused-app bundle so a mismatch between AI-claimed target and
 /// reality is visible to the user.
-function requestConsent(target, description, observedBundle = null) {
+///
+/// Approval cache key (Codex HIGH#3): (observedBundle, target). An
+/// approval granted while Safari was focused does NOT auto-extend to
+/// 1Password — even though the agent's `target` string didn't change,
+/// the observed bundle did. New (bundle, target) pair re-prompts.
+function requestConsent(target, description, observedBundle) {
   if (READ_ONLY) return false;
+  // observedBundle is REQUIRED by guardedWrite() — null/empty means the
+  // deny-list check was bypassed somehow, fail closed.
+  if (!observedBundle) return false;
+  const key = approvalKey(target, observedBundle);
+  if (approvedTargets.has(key)) return true;
+  // AUTO_APPROVE bypass runs AFTER deny-list (caller already passed
+  // enforceDenyList), AFTER null-bundle guard, but BEFORE the dialog.
+  // Tests rely on it; humans should never enable it.
   if (AUTO_APPROVE) return true;
-  if (approvedTargets.has(target)) return true;
   const title = 'Tinky Vision MCP — Action approval';
-  const observed = observedBundle
-    ? `\n\nObserved focused app: ${observedBundle}`
-    : '';
   const detail =
     `Claude wants to perform an OS-level action:\n\n${description}` +
-    `\n\nTarget: ${target}${observed}` +
-    `\n\nApprove this and future actions against this target for the current session?`;
+    `\n\nTarget (AI-claimed): ${target}` +
+    `\nObserved focused app:  ${observedBundle}` +
+    `\n\nApprove this action? "Approve session" remembers ONLY this exact ` +
+    `(target × observed app) pair — if focus shifts to a different app, ` +
+    `you will be re-prompted.`;
   const script = `
     set theResponse to display dialog ${JSON.stringify(detail)} with title ${JSON.stringify(title)} buttons {"Deny", "Approve once", "Approve session"} default button "Deny" with icon caution
     set btn to button returned of theResponse
@@ -201,7 +280,7 @@ function requestConsent(target, description, observedBundle = null) {
       timeout: 60_000,
     }).trim();
     if (out === 'Approve session') {
-      approvedTargets.add(target);
+      approvedTargets.add(key);
       return true;
     }
     if (out === 'Approve once') return true;
@@ -216,7 +295,7 @@ function requestConsent(target, description, observedBundle = null) {
 /// throws on any block.
 function guardedWrite(toolName, target, description) {
   if (READ_ONLY) throw new Error('Write tools disabled (--read-only).');
-  const observedBundle = enforceDenyList(toolName);
+  const observedBundle = enforceDenyList(toolName);   // throws if uncertain or denied
   if (!requestConsent(target, description, observedBundle)) {
     throw new Error(`User denied consent for ${toolName}.`);
   }

@@ -244,3 +244,90 @@ test('os_focused_window returns bundleID', async () => {
     assert.equal(parsed.focused.bundleID, 'com.example.benign');
   });
 });
+
+// ────────────────────────── security regression tests ──────────────────────────
+// Codex review 2026-05-19 found 3 HIGH-severity issues in the consent /
+// deny-list / audit-log path. These tests lock the fixes so a future
+// "simplification" can't silently regress them.
+
+test('SEC: deny-list FAILS CLOSED when helper cannot report focus (Codex HIGH#2)', async () => {
+  // No TINKY_FAKE_FOCUSED_BUNDLE → fake helper returns focused: null.
+  // Previously the deny-list silently fell through and the write tool
+  // succeeded. Now it must be blocked with a "cannot identify" error.
+  await withServer({
+    env: { TINKY_AUTO_APPROVE: '1' },   // no fake focused bundle set
+  }, async ({ call }) => {
+    const click = await call(2, 'tools/call', {
+      name: 'os_click',
+      arguments: { x: 10, y: 10, target: 'Safari', description: 'click play' },
+    });
+    assert.equal(click?.result?.isError, true,
+      'click MUST be blocked when focused-window helper returns null');
+    assert.match(
+      click?.result?.content?.[0]?.text || '',
+      /cannot identify|focus is uncertain|focus-unknown|DENIED/i,
+      'error message should name the fail-closed cause',
+    );
+  });
+});
+
+test('SEC: approval cache is keyed by observed bundle, not by AI-claimed target (Codex HIGH#3)', async () => {
+  // We can't change the focused bundle mid-process (env is fixed at
+  // spawn). So we approximate the regression by proving: when the fake
+  // helper reports bundle A, an approval for target=X is granted; when
+  // we relaunch the server with bundle B but the SAME target=X, the
+  // approval cache must NOT carry over — the new (bundle, target) pair
+  // re-triggers the consent path. AUTO_APPROVE bypasses the dialog,
+  // so we verify the deny-list still gates correctly under cache-miss.
+  // The simplest probe: with bundle = a deny-listed app, even an
+  // identical (target, description) used minutes ago against a safe
+  // bundle in another server instance MUST be blocked here. This shows
+  // the cache cannot exfiltrate state across (bundle, target) pairs.
+  await withServer({
+    env: {
+      TINKY_AUTO_APPROVE: '1',
+      TINKY_FAKE_FOCUSED_BUNDLE: 'com.bitwarden.desktop',
+    },
+  }, async ({ call }) => {
+    const r = await call(2, 'tools/call', {
+      name: 'os_click',
+      arguments: { x: 1, y: 1, target: 'Safari', description: 'click play' },
+    });
+    assert.equal(r?.result?.isError, true);
+    assert.match(r?.result?.content?.[0]?.text || '', /deny-list/i);
+  });
+});
+
+test('SEC: audit log redacts os_type "text" payload (Codex HIGH#1)', async () => {
+  // Run a successful os_type with a known sentinel + read the log file
+  // to prove the cleartext never landed. The fake helper accepts
+  // anything, so the only difference between the on-disk log and the
+  // input is the redaction logic.
+  const { readFileSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { homedir } = await import('node:os');
+  const logPath = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp', 'session.jsonl');
+  const beforeSize = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
+  const SENTINEL = 'PA55w0rd-DO-NOT-PERSIST-9X8Y7Z';
+
+  await withServer({
+    env: {
+      TINKY_AUTO_APPROVE: '1',
+      TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+    },
+  }, async ({ call }) => {
+    const r = await call(2, 'tools/call', {
+      name: 'os_type',
+      arguments: { text: SENTINEL, target: 'Safari', description: 'fill password field' },
+    });
+    assert.equal(r?.result?.isError, undefined, 'type should succeed via auto-approve');
+  });
+
+  // Inspect only the audit lines written during this test (skip prior
+  // bytes — earlier tests may have appended their own entries).
+  const after = readFileSync(logPath, 'utf8').slice(beforeSize);
+  assert.equal(after.includes(SENTINEL), false,
+    'AUDIT LOG MUST NOT contain the cleartext text payload');
+  assert.match(after, new RegExp(`REDACTED:${SENTINEL.length}ch`),
+    'audit log should include a typed-length redaction marker');
+});

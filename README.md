@@ -232,3 +232,17 @@ MIT (the code). Your responsibility to use it safely (everything else).
 ## Made by
 
 Luke Kist · [Age Well Alliance / TinkyTown](https://tinkysales.vercel.app)
+
+## Deployment / no-drift (maintainers)
+
+Two dirs hold this code — do NOT edit both:
+
+- **Canonical (edit here):** `~/tinky-vision-mcp` (this repo, GitHub remote).
+- **Running (what `~/.mcp.json` launches):** `~/.kist/mcp/tinky-vision-mcp`.
+
+They are separate git repos. To stop them drifting (they once both shipped
+`v0.1.2` with different code — one missing the machine-freeze guard), the
+canonical repo's `post-commit`/`post-merge` hooks auto-run `tinky-vision-sync`,
+which copies the git-tracked files canonical → running (binaries in `bin/` and
+`node_modules/` are never touched). Manual: `tinky-vision-sync` to redeploy,
+`tinky-vision-sync check` to detect drift (exit 1 if any).

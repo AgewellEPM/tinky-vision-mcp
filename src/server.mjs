@@ -55,7 +55,7 @@
 // ~100 tool calls is cheap, and off-by-N around the threshold is
 // harmless.
 //
-// LABEL: v0.1.2 — PILOT-READY for vision + non-sensitive automation.
+// LABEL: v0.1.3 — PILOT-READY for vision + non-sensitive automation.
 // 15/15 tests green (3 functional + 3 SEC regressions + 2 OPS rotation
 // + 7 detection). Still needs signed binary distribution + real-app
 // hardware smoke before PRODUCTION-READY.
@@ -532,7 +532,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: 'tinky-vision-mcp',
-    version: '0.1.2',
+    version: '0.1.3',
   },
   {
     capabilities: { tools: {} },

@@ -55,7 +55,7 @@
 // ~100 tool calls is cheap, and off-by-N around the threshold is
 // harmless.
 //
-// LABEL: v0.1.2 — PILOT-READY for vision + non-sensitive automation.
+// LABEL: v0.1.3 — PILOT-READY for vision + non-sensitive automation.
 // 15/15 tests green (3 functional + 3 SEC regressions + 2 OPS rotation
 // + 7 detection). Still needs signed binary distribution + real-app
 // hardware smoke before PRODUCTION-READY.
@@ -82,7 +82,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // HELPER_BIN can be overridden via env for tests (fake helper script
 // that emits canned JSON). Default = the prebuilt Swift binary.
 const HELPER_BIN = process.env.TINKY_HELPER_BIN ||
-  resolve(__dirname, '..', 'bin', 'tinky-os');
+  (existsSync(resolve(__dirname, '..', 'bin', 'tinky-os-ax'))
+    ? resolve(__dirname, '..', 'bin', 'tinky-os-ax')
+    : resolve(__dirname, '..', 'bin', 'tinky-os'));
 const LOG_DIR = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp');
 const LOG_FILE = join(LOG_DIR, 'session.jsonl');
 const READ_ONLY = process.argv.includes('--read-only');
@@ -122,6 +124,34 @@ const DEFAULT_DENY = new Set([
 const EXTRA_DENY = (process.env.TINKY_DENY_BUNDLES || '')
   .split(':').map(s => s.trim()).filter(Boolean);
 const DENY_BUNDLES = new Set([...DEFAULT_DENY, ...EXTRA_DENY]);
+
+// ─────────────────────── self-substrate protection ───────────────────────
+// HARD block (un-bypassable by consent): refuse a WRITE whose payload is a
+// self-restart of the Kist runtime this agent lives in. On 2026-07-09 an agent
+// typed/approved `launchctl kickstart -k com.kist.desktop-vision-console`,
+// restarting the service it ran inside; KeepAlive respawned it in a heavy-model
+// reload loop and froze the machine.
+//
+// This checks only the CHEAP, hot-path signals: the text being typed and the
+// caller's action label — NOT per-keystroke screen OCR (too heavy for every
+// click/type; the console's circuit breaker is the deterministic backstop for
+// the "press enter on a pre-shown command" case).
+function substrateContentRefusal(...parts) {
+  const text = parts.filter(Boolean).map(String).join(' ').toLowerCase();
+  const reason =
+    'DENIED: self-substrate protection — refusing to type/click a self-restart of the Kist runtime '
+    + 'this agent lives in (launchctl on com.kist.* / kill of the desktop-vision-console / port 8765). '
+    + 'This froze the machine on 2026-07-09. A human must do it from a terminal that is NOT this service.';
+  if (text.includes('launchctl') && text.includes('com.kist.')) {
+    const mutators = ['kickstart', 'bootout', 'unload', 'load', 'bootstrap',
+                      'remove', 'disable', 'enable', 'stop', 'kill'];
+    if (mutators.some(m => text.includes(m))) return reason;
+  }
+  const touchesConsole = text.includes('desktop-vision-console') || text.includes('com.kist.runtime');
+  if (touchesConsole && (text.includes('pkill') || text.includes('killall') || text.includes('kill '))) return reason;
+  if (text.includes('8765') && (text.includes('kill') || text.includes('fuser'))) return reason;
+  return null;
+}
 
 if (!existsSync(HELPER_BIN)) {
   console.error(
@@ -502,7 +532,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: 'tinky-vision-mcp',
-    version: '0.1.2',
+    version: '0.1.3',
   },
   {
     capabilities: { tools: {} },
@@ -533,6 +563,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         result = callHelper('find-window', ['--query', args.query ?? '']);
         break;
       case 'os_click': {
+        { const sub = substrateContentRefusal(args.description, args.target); if (sub) throw new Error(sub); }
         guardedWrite('os_click', args.target,
           `os_click(x=${args.x}, y=${args.y}${args.double ? ', double' : ''}): ${args.description}`);
         const argv = ['--x', String(args.x), '--y', String(args.y)];
@@ -541,12 +572,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       }
       case 'os_type': {
+        { const sub = substrateContentRefusal(args.text, args.description, args.target); if (sub) throw new Error(sub); }
         guardedWrite('os_type', args.target,
           `os_type(${String(args.text || '').length} chars): ${args.description}`);
         result = callHelper('type', ['--text', String(args.text)]);
         break;
       }
       case 'os_key': {
+        { const sub = substrateContentRefusal(args.description, args.target); if (sub) throw new Error(sub); }
         const mods = ['cmd','shift','opt','ctrl'].filter(m => args[m]).join('+');
         guardedWrite('os_key', args.target,
           `os_key(${mods ? mods + '+' : ''}${args.key}): ${args.description}`);

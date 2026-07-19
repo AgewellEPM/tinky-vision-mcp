@@ -4,3 +4,4 @@ swift-helper/.swiftpm/
 bin/tinky-os
 *.log
 .DS_Store
+bin/tinky-os-ax

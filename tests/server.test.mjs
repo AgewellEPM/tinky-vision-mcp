@@ -344,6 +344,7 @@ test('OPS: audit log rotates when size exceeds TINKY_AUDIT_ROTATE_MAX', async ()
       TINKY_AUTO_APPROVE: '1',
       TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
       TINKY_AUDIT_ROTATE_MAX: '1024',
+      TINKY_AUDIT_KEEP_FILES: '99',
     },
   }, async ({ call }) => {
     // First call triggers the rotate check (counter=1 in our impl

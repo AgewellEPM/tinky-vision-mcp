@@ -23,6 +23,8 @@
 //                       the query
 //   tinky-os ax-check
 //                       0 if Accessibility granted, 1 if not
+//   tinky-os ax-tree [--all] [--app <bundleID>] [--pid <int>] [--max <int>]
+//                       snapshot visible app accessibility elements
 //
 // Output format: JSON to stdout on success, JSON to stderr on error.
 // All stdout lines are valid JSON so the Node host can JSON.parse them
@@ -390,6 +392,264 @@ func cmdFocusedWindow(_ args: Args) {
     ])
 }
 
+// MARK: - Accessibility tree
+
+func axValue(_ element: AXUIElement, _ attr: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    let err = AXUIElementCopyAttributeValue(element, attr, &value)
+    if err == .success { return value }
+    return nil
+}
+
+func axString(_ element: AXUIElement, _ attr: CFString) -> String {
+    guard let value = axValue(element, attr) else { return "" }
+    if let text = value as? String { return text }
+    if let number = value as? NSNumber { return number.stringValue }
+    return ""
+}
+
+func axBool(_ element: AXUIElement, _ attr: CFString) -> Bool? {
+    guard let value = axValue(element, attr) else { return nil }
+    if let bool = value as? Bool { return bool }
+    if let number = value as? NSNumber { return number.boolValue }
+    return nil
+}
+
+func axElements(_ element: AXUIElement, _ attr: CFString) -> [AXUIElement] {
+    guard let value = axValue(element, attr) else { return [] }
+    if let elements = value as? [AXUIElement] { return elements }
+    if let array = value as? [AnyObject] {
+        return array.map { $0 as! AXUIElement }
+    }
+    return []
+}
+
+func axPoint(_ element: AXUIElement) -> CGPoint? {
+    guard let value = axValue(element, kAXPositionAttribute as CFString),
+          CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    let ax = value as! AXValue
+    guard
+          AXValueGetType(ax) == .cgPoint else { return nil }
+    var point = CGPoint.zero
+    return AXValueGetValue(ax, .cgPoint, &point) ? point : nil
+}
+
+func axSize(_ element: AXUIElement) -> CGSize? {
+    guard let value = axValue(element, kAXSizeAttribute as CFString),
+          CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    let ax = value as! AXValue
+    guard
+          AXValueGetType(ax) == .cgSize else { return nil }
+    var size = CGSize.zero
+    return AXValueGetValue(ax, .cgSize, &size) ? size : nil
+}
+
+func axLabel(role: String, title: String, value: String, desc: String, identifier: String) -> String {
+    let parts = [title, value, desc, identifier]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    if !parts.isEmpty { return parts.joined(separator: " ") }
+    return role.replacingOccurrences(of: "AX", with: "")
+}
+
+func visibleWindowRows() -> [[String: Any]] {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let arr = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    var rows: [[String: Any]] = []
+    for w in arr {
+        let layer = (w[kCGWindowLayer as String] as? Int) ?? -1
+        if layer != 0 { continue }
+        rows.append([
+            "windowID": (w[kCGWindowNumber as String] as? Int) ?? 0,
+            "title": (w[kCGWindowName as String] as? String) ?? "",
+            "owner": (w[kCGWindowOwnerName as String] as? String) ?? "",
+            "pid": (w[kCGWindowOwnerPID as String] as? Int) ?? 0,
+            "bounds": (w[kCGWindowBounds as String] as? [String: Any]) ?? [:],
+        ])
+    }
+    return rows
+}
+
+func screenSnapshotInfo() -> [String: Any] {
+    guard let screen = NSScreen.main else {
+        return ["scale": 1.0]
+    }
+    let frame = screen.frame
+    let scale = screen.backingScaleFactor
+    return [
+        "scale": Double(scale),
+        "points": [
+            "x": Int(frame.origin.x),
+            "y": Int(frame.origin.y),
+            "w": Int(frame.size.width),
+            "h": Int(frame.size.height),
+        ],
+        "pixels": [
+            "x": Int(frame.origin.x * scale),
+            "y": Int(frame.origin.y * scale),
+            "w": Int(frame.size.width * scale),
+            "h": Int(frame.size.height * scale),
+        ],
+    ]
+}
+
+func appendAXElement(
+    _ element: AXUIElement,
+    app: NSRunningApplication,
+    depth: Int,
+    path: String,
+    maxDepth: Int,
+    maxCount: Int,
+    scale: CGFloat,
+    out: inout [[String: Any]],
+    visited: inout Set<CFHashCode>
+) {
+    if out.count >= maxCount || depth > maxDepth { return }
+    let key = CFHash(element)
+    if visited.contains(key) { return }
+    visited.insert(key)
+
+    let role = axString(element, kAXRoleAttribute as CFString)
+    let subrole = axString(element, kAXSubroleAttribute as CFString)
+    let title = axString(element, kAXTitleAttribute as CFString)
+    let value = axString(element, kAXValueAttribute as CFString)
+    let desc = axString(element, kAXDescriptionAttribute as CFString)
+    let identifier = axString(element, kAXIdentifierAttribute as CFString)
+    let label = axLabel(role: role, title: title, value: value, desc: desc, identifier: identifier)
+    let point = axPoint(element)
+    let size = axSize(element)
+
+    if let point, let size, size.width > 1, size.height > 1, (!label.isEmpty || !role.isEmpty) {
+        let px = Int(point.x * scale)
+        let py = Int(point.y * scale)
+        let pw = Int(size.width * scale)
+        let ph = Int(size.height * scale)
+        let id = String(format: "AX%03d", out.count + 1)
+        out.append([
+            "id": id,
+            "source": "ax",
+            "role": role,
+            "kind": role.isEmpty ? "AXElement" : role,
+            "subrole": subrole,
+            "label": String(label.prefix(180)),
+            "title": String(title.prefix(180)),
+            "value": String(value.prefix(180)),
+            "description": String(desc.prefix(180)),
+            "identifier": String(identifier.prefix(120)),
+            "app": app.localizedName ?? "",
+            "bundleID": app.bundleIdentifier ?? "",
+            "pid": Int(app.processIdentifier),
+            "enabled": axBool(element, kAXEnabledAttribute as CFString) as Any,
+            "focused": axBool(element, kAXFocusedAttribute as CFString) as Any,
+            "depth": depth,
+            "path": path,
+            "pointBounds": [
+                "x": Int(point.x), "y": Int(point.y),
+                "w": Int(size.width), "h": Int(size.height),
+                "cx": Int(point.x + size.width / 2),
+                "cy": Int(point.y + size.height / 2),
+            ],
+            "pixelBounds": [
+                "x": px, "y": py, "w": pw, "h": ph,
+                "cx": px + pw / 2, "cy": py + ph / 2,
+            ],
+        ])
+    }
+
+    var children: [AXUIElement] = []
+    children.append(contentsOf: axElements(element, kAXVisibleChildrenAttribute as CFString))
+    children.append(contentsOf: axElements(element, kAXChildrenAttribute as CFString))
+    children.append(contentsOf: axElements(element, kAXContentsAttribute as CFString))
+    for (index, child) in children.enumerated() {
+        if out.count >= maxCount { break }
+        appendAXElement(
+            child,
+            app: app,
+            depth: depth + 1,
+            path: "\(path)/\(role.isEmpty ? "element" : role)[\(index)]",
+            maxDepth: maxDepth,
+            maxCount: maxCount,
+            scale: scale,
+            out: &out,
+            visited: &visited
+        )
+    }
+}
+
+func cmdAXTree(_ args: Args) {
+    requireAccessibility()
+    let maxCount = Int(args.opts["max"] ?? "600") ?? 600
+    let maxDepth = Int(args.opts["depth"] ?? "8") ?? 8
+    let allVisible = args.flags.contains("all")
+    let bundleID = args.opts["app"] ?? args.opts["bundle"]
+    let pidFilter = args.opts["pid"].flatMap { Int32($0) }
+    let screen = screenSnapshotInfo()
+    let scale = CGFloat((screen["scale"] as? Double) ?? 1.0)
+    let windows = visibleWindowRows()
+    var apps: [NSRunningApplication] = []
+
+    if let pidFilter {
+        if let app = NSRunningApplication(processIdentifier: pid_t(pidFilter)) {
+            apps = [app]
+        }
+    } else if let bundleID, !bundleID.isEmpty {
+        apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+    } else if allVisible {
+        let pids = Set(windows.compactMap { row -> pid_t? in
+            guard let pid = row["pid"] as? Int else { return nil }
+            return pid_t(pid)
+        })
+        apps = pids.compactMap { NSRunningApplication(processIdentifier: $0) }
+    } else if let app = NSWorkspace.shared.frontmostApplication {
+        apps = [app]
+    }
+
+    var elements: [[String: Any]] = []
+    var visited = Set<CFHashCode>()
+    for app in apps {
+        if elements.count >= maxCount { break }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        var roots = axElements(root, kAXWindowsAttribute as CFString)
+        if roots.isEmpty { roots = [root] }
+        for (index, item) in roots.enumerated() {
+            appendAXElement(
+                item,
+                app: app,
+                depth: 0,
+                path: "\(app.bundleIdentifier ?? "app")/window[\(index)]",
+                maxDepth: maxDepth,
+                maxCount: maxCount,
+                scale: scale,
+                out: &elements,
+                visited: &visited
+            )
+        }
+    }
+
+    elements.sort {
+        let a = $0["pixelBounds"] as? [String: Any] ?? [:]
+        let b = $1["pixelBounds"] as? [String: Any] ?? [:]
+        let ay = a["y"] as? Int ?? 0
+        let by = b["y"] as? Int ?? 0
+        if ay != by { return ay < by }
+        return (a["x"] as? Int ?? 0) < (b["x"] as? Int ?? 0)
+    }
+
+    jsonOut([
+        "ok": true,
+        "accessibility": true,
+        "mode": pidFilter != nil ? "pid" : (bundleID != nil ? "app" : (allVisible ? "all-visible-apps" : "frontmost-app")),
+        "appFilter": bundleID as Any,
+        "pidFilter": pidFilter as Any,
+        "screen": screen,
+        "windows": windows,
+        "elements": elements,
+        "elementCount": elements.count,
+    ])
+}
+
 // MARK: - OCR (find-text)
 //
 // Captures a screenshot of the whole main screen (or an existing image
@@ -529,6 +789,7 @@ case "apps":           cmdApps(args)
 case "find-window":    cmdFindWindow(args)
 case "focused-window": cmdFocusedWindow(args)
 case "find-text":      cmdFindText(args)
+case "ax-tree":        cmdAXTree(args)
 case "ax-check":       cmdAXCheck(args)
 case "help", "--help", "-h":
     print("""
@@ -543,6 +804,7 @@ case "help", "--help", "-h":
       find-window --query "<substring>"
       focused-window
       find-text [--query "<substring>"] [--in <png>]
+      ax-tree [--all] [--app <bundleID>] [--pid <int>] [--max <int>] [--depth <int>]
       ax-check
     """)
 default:

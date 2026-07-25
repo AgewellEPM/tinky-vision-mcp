@@ -72,13 +72,13 @@ async function withServer({ env = {}, args = [] } = {}, fn) {
   };
 
   // Always initialize first.
-  await call(1, 'initialize', {
+  const initialize = await call(1, 'initialize', {
     protocolVersion: '2024-11-05', capabilities: {},
     clientInfo: { name: 'test', version: '0' },
   });
 
   try {
-    return await fn({ call });
+    return await fn({ call, initialize });
   } finally {
     srv.kill();
   }
@@ -91,7 +91,8 @@ function toolResult(resp) {
 }
 
 test('server boots and exposes the expected 9 tools', async () => {
-  await withServer({}, async ({ call }) => {
+  await withServer({}, async ({ call, initialize }) => {
+    assert.equal(initialize?.result?.serverInfo?.version, '0.1.4');
     const list = await call(2, 'tools/list');
     const tools = list?.result?.tools ?? [];
     const names = tools.map(t => t.name).sort();

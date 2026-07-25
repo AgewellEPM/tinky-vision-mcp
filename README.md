@@ -167,7 +167,8 @@ disable security features.
    process. New target → new dialog. Server restart → re-approve.
 4. **Audit log.** Every tool call (success or failure) appended to
    `~/Library/Logs/tinky-vision-mcp/session.jsonl`. You can `tail -f`
-   it during a session.
+   it during a session. Set `TINKY_AUDIT_PATH` to an absolute per-process
+   `.jsonl` path when an isolated runner must not share that log.
 5. **`--read-only` mode.** Pass `--read-only` to disable all write
    tools at startup. The MCP host sees only the read tools.
 

@@ -4,6 +4,15 @@ All notable changes to **tinky-vision-mcp** are documented here. Format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
 
+## [0.1.4] — 2026-07-24
+
+### Fixed
+- Isolate audit-log tests with `TINKY_AUDIT_PATH`, preventing parallel test
+  processes from writing or rotating the same user log and causing false
+  safety failures.
+- Pin the tested MCP SDK and patched transitive dependency versions, including
+  its unused HTTP dependency chain. The MCP transport remains local stdio.
+
 ## [0.1.3] — 2026-07-19
 
 ### Security

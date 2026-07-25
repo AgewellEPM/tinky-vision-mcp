@@ -85,8 +85,13 @@ const HELPER_BIN = process.env.TINKY_HELPER_BIN ||
   (existsSync(resolve(__dirname, '..', 'bin', 'tinky-os-ax'))
     ? resolve(__dirname, '..', 'bin', 'tinky-os-ax')
     : resolve(__dirname, '..', 'bin', 'tinky-os'));
-const LOG_DIR = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp');
-const LOG_FILE = join(LOG_DIR, 'session.jsonl');
+const DEFAULT_LOG_FILE = join(
+  homedir(), 'Library', 'Logs', 'tinky-vision-mcp', 'session.jsonl',
+);
+// Tests and isolated operators can route one server process to its own log.
+// The default remains the established user-visible location.
+const LOG_FILE = resolve(process.env.TINKY_AUDIT_PATH || DEFAULT_LOG_FILE);
+const LOG_DIR = dirname(LOG_FILE);
 const READ_ONLY = process.argv.includes('--read-only');
 
 // AUTO_APPROVE bypasses the osascript dialog. Used by `npm test` and by

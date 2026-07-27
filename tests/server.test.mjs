@@ -188,6 +188,8 @@ test('auto-approve allows os_click when focused app is benign', async () => {
     });
     assert.equal(click?.result?.isError, undefined, 'should succeed');
     const r = toolResult(click);
+    assert.match(r.auditReceipt?.eventId || '', /^\d+-\d+-\d+$/);
+    assert.equal(typeof r.auditReceipt?.logFile, 'string');
     assert.equal(r.ok, true);
     assert.equal(r.fake, true);
     assert.equal(r.sub, 'click');

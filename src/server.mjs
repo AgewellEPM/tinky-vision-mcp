@@ -240,14 +240,24 @@ function rotateIfNeeded() {
 }
 
 function audit(entry) {
-  if (AUDIT_DISABLED) return;
+  if (AUDIT_DISABLED) return null;
   const safe = { ...entry };
   if (safe.args) safe.args = redactArgsForAudit(safe.tool, safe.args);
-  const line = JSON.stringify({ ts: Date.now(), ...safe }) + '\n';
+  const ts = Date.now();
+  audit._counter = (audit._counter || 0) + 1;
+  const eventId = `${ts}-${process.pid}-${audit._counter}`;
+  const event = { ts, eventId, ...safe };
+  const line = JSON.stringify(event) + '\n';
   try {
     rotateIfNeeded();
     appendFileSync(LOG_FILE, line);
-  } catch { /* silent */ }
+    return { eventId, ts, logFile: LOG_FILE };
+  } catch {
+    // A missing audit receipt must be visible to callers. The tool action may
+    // already have occurred, so return an explicit unavailable marker rather
+    // than pretending there is durable evidence.
+    return { eventId, ts, logFile: LOG_FILE, durable: false };
+  }
 }
 
 // ────────────────────────── helper invocation ──────────────────────────
@@ -613,7 +623,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-    audit({ tool: name, args, ok: true, ms: Date.now() - startedAt });
+    const auditReceipt = audit({ tool: name, args, ok: true, ms: Date.now() - startedAt });
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      result = { ...result, auditReceipt };
+    }
     return {
       content: [{ type: 'text', text: JSON.stringify(result) }],
     };

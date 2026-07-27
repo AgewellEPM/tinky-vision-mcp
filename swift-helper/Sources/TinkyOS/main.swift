@@ -777,6 +777,134 @@ func cmdAXCheck(_ args: Args) {
     exit(granted ? 0 : 1)
 }
 
+// MARK: - Stream (continuous ScreenCaptureKit capture → atomic JPEG frames)
+//
+// `tinky-os stream --out DIR [--fps N] [--scale F] [--quality F] [--ring N]`
+// writes DIR/latest.jpg atomically (tmp + rename) at up to N fps, plus an
+// optional bounded ring of numbered frames (frame-0000.jpg … frame-(ring-1).jpg,
+// slots reused cyclically — history is capped by construction, never pruned by
+// a separate job). Runs until SIGTERM/SIGINT; heartbeats JSON to stdout every
+// 5s so a supervisor can verify liveness. Requires Screen Recording permission
+// on the responsible process (same TCC grant `screenshot` already relies on).
+
+import ScreenCaptureKit
+import CoreImage
+import CoreMedia
+
+final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
+    private let dir: URL
+    private let ring: Int
+    private let quality: CGFloat
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    // Written on the sample queue, read from the heartbeat loop. Int reads of a
+    // monotonically-increasing counter are tolerable here; a lock would be
+    // overkill for a diagnostic heartbeat.
+    private(set) var frames: Int = 0
+    private(set) var writeFailures: Int = 0
+
+    init(dir: URL, ring: Int, quality: CGFloat) {
+        self.dir = dir
+        self.ring = ring
+        self.quality = quality
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+                of type: SCStreamOutputType) {
+        guard type == .screen,
+              sampleBuffer.isValid,
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        let qualityKey = CIImageRepresentationOption(
+            rawValue: kCGImageDestinationLossyCompressionQuality as String)
+        guard let jpeg = ciContext.jpegRepresentation(
+            of: image, colorSpace: colorSpace, options: [qualityKey: quality]) else {
+            writeFailures += 1
+            return
+        }
+        let tmp = dir.appendingPathComponent(".latest.tmp")
+        let latest = dir.appendingPathComponent("latest.jpg")
+        do {
+            try jpeg.write(to: tmp)
+            _ = try FileManager.default.replaceItemAt(latest, withItemAt: tmp)
+            if ring > 0 {
+                try? jpeg.write(to: dir.appendingPathComponent(
+                    String(format: "frame-%04d.jpg", frames % ring)))
+            }
+            frames += 1
+        } catch {
+            writeFailures += 1
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let payload = ["ok": false, "error": "stream stopped: \(error.localizedDescription)"] as [String: Any]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let s = String(data: data, encoding: .utf8) {
+            FileHandle.standardError.write(Data((s + "\n").utf8))
+        }
+        exit(4)
+    }
+}
+
+func cmdStream(_ args: Args) {
+    guard let outDir = args.opts["out"] else {
+        jsonErr("stream requires --out <dir>")
+    }
+    let fps = max(1, min(60, Int(args.opts["fps"] ?? "15") ?? 15))
+    let scale = min(1.0, max(0.1, Double(args.opts["scale"] ?? "0.5") ?? 0.5))
+    let quality = min(1.0, max(0.1, Double(args.opts["quality"] ?? "0.6") ?? 0.6))
+    let ring = max(0, Int(args.opts["ring"] ?? "0") ?? 0)
+    let dir = URL(fileURLWithPath: outDir, isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    } catch {
+        jsonErr("cannot create --out dir \(outDir): \(error.localizedDescription)")
+    }
+
+    let sink = StreamSink(dir: dir, ring: ring, quality: CGFloat(quality))
+    // Retain the stream for the process lifetime; released only at exit.
+    var retainedStream: SCStream?
+
+    Task {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false, onScreenWindowsOnly: false)
+            guard let display = content.displays.first else {
+                jsonErr("no capturable display (Screen Recording permission missing?)", code: 3)
+            }
+            let config = SCStreamConfiguration()
+            config.width = max(64, Int(Double(display.width) * scale))
+            config.height = max(64, Int(Double(display.height) * scale))
+            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.queueDepth = 5
+            config.showsCursor = true
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let stream = SCStream(filter: filter, configuration: config, delegate: sink)
+            try stream.addStreamOutput(
+                sink, type: .screen,
+                sampleHandlerQueue: DispatchQueue(label: "tinky.stream.sample"))
+            try await stream.startCapture()
+            retainedStream = stream
+            _ = retainedStream // silence "written but never read" — lifetime anchor
+            jsonOut(["ok": true, "streaming": true, "dir": outDir, "fps": fps,
+                     "scale": scale, "quality": quality, "ring": ring,
+                     "width": config.width, "height": config.height])
+            fflush(stdout)
+            while true {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                jsonOut(["ok": true, "heartbeat": true, "frames": sink.frames,
+                         "writeFailures": sink.writeFailures])
+                fflush(stdout)
+            }
+        } catch {
+            jsonErr("stream failed: \(error.localizedDescription)", code: 4)
+        }
+    }
+    dispatchMain()
+}
+
 // MARK: - Main
 
 let args = Args.parse(CommandLine.arguments)
@@ -791,6 +919,7 @@ case "focused-window": cmdFocusedWindow(args)
 case "find-text":      cmdFindText(args)
 case "ax-tree":        cmdAXTree(args)
 case "ax-check":       cmdAXCheck(args)
+case "stream":         cmdStream(args)
 case "help", "--help", "-h":
     print("""
     tinky-os — macOS primitives for the Tinky Vision MCP bridge.
@@ -806,6 +935,7 @@ case "help", "--help", "-h":
       find-text [--query "<substring>"] [--in <png>]
       ax-tree [--all] [--app <bundleID>] [--pid <int>] [--max <int>] [--depth <int>]
       ax-check
+      stream --out <dir> [--fps <1-60>] [--scale <0.1-1>] [--quality <0.1-1>] [--ring <n>]
     """)
 default:
     jsonErr("Unknown command '\(args.cmd)'. Run `tinky-os help`.")

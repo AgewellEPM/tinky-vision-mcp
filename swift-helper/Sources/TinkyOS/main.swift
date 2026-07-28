@@ -867,39 +867,55 @@ func cmdStream(_ args: Args) {
     var retainedStream: SCStream?
 
     Task {
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false, onScreenWindowsOnly: false)
-            guard let display = content.displays.first else {
-                jsonErr("no capturable display (Screen Recording permission missing?)", code: 3)
-            }
-            let config = SCStreamConfiguration()
-            config.width = max(64, Int(Double(display.width) * scale))
-            config.height = max(64, Int(Double(display.height) * scale))
-            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-            config.pixelFormat = kCVPixelFormatType_32BGRA
-            config.queueDepth = 5
-            config.showsCursor = true
-            let filter = SCContentFilter(display: display, excludingWindows: [])
-            let stream = SCStream(filter: filter, configuration: config, delegate: sink)
-            try stream.addStreamOutput(
-                sink, type: .screen,
-                sampleHandlerQueue: DispatchQueue(label: "tinky.stream.sample"))
-            try await stream.startCapture()
-            retainedStream = stream
-            _ = retainedStream // silence "written but never read" — lifetime anchor
-            jsonOut(["ok": true, "streaming": true, "dir": outDir, "fps": fps,
-                     "scale": scale, "quality": quality, "ring": ring,
-                     "width": config.width, "height": config.height])
-            fflush(stdout)
-            while true {
-                try await Task.sleep(nanoseconds: 5_000_000_000)
-                jsonOut(["ok": true, "heartbeat": true, "frames": sink.frames,
-                         "writeFailures": sink.writeFailures])
+        // Retry-alive: the FIRST capture attempt triggers the macOS Screen
+        // Recording prompt and fails until the user grants it. Instead of
+        // exiting, we stay alive and retry every 2s — so the app survives the
+        // prompt, and the instant the user clicks Allow, streaming begins with
+        // no relaunch. This is what makes a .app-bundle grant actually land.
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false, onScreenWindowsOnly: false)
+                guard let display = content.displays.first else {
+                    throw NSError(domain: "tinky.stream", code: 3, userInfo: [
+                        NSLocalizedDescriptionKey: "no capturable display yet"])
+                }
+                let config = SCStreamConfiguration()
+                config.width = max(64, Int(Double(display.width) * scale))
+                config.height = max(64, Int(Double(display.height) * scale))
+                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+                config.pixelFormat = kCVPixelFormatType_32BGRA
+                config.queueDepth = 5
+                config.showsCursor = true
+                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let stream = SCStream(filter: filter, configuration: config, delegate: sink)
+                try stream.addStreamOutput(
+                    sink, type: .screen,
+                    sampleHandlerQueue: DispatchQueue(label: "tinky.stream.sample"))
+                try await stream.startCapture()
+                retainedStream = stream
+                _ = retainedStream // lifetime anchor
+                jsonOut(["ok": true, "streaming": true, "dir": outDir, "fps": fps,
+                         "scale": scale, "quality": quality, "ring": ring,
+                         "width": config.width, "height": config.height,
+                         "grantedAfterAttempts": attempt])
                 fflush(stdout)
+                while true {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    jsonOut(["ok": true, "heartbeat": true, "frames": sink.frames,
+                             "writeFailures": sink.writeFailures])
+                    fflush(stdout)
+                }
+            } catch {
+                // Stay alive through the permission prompt; do NOT exit.
+                jsonOut(["ok": false, "awaitingPermission": true, "attempt": attempt,
+                         "hint": "Grant Screen Recording to this app, then it streams automatically",
+                         "error": error.localizedDescription])
+                fflush(stdout)
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
-        } catch {
-            jsonErr("stream failed: \(error.localizedDescription)", code: 4)
         }
     }
     dispatchMain()
@@ -907,7 +923,28 @@ func cmdStream(_ args: Args) {
 
 // MARK: - Main
 
-let args = Args.parse(CommandLine.arguments)
+/// When LaunchServices/launchd starts the `.app` bundle, the executable is invoked with NO
+/// subcommand (argv.count == 1) — which would otherwise fall through to `help` and exit
+/// immediately. Detect the bundle context and synthesize a `stream` invocation instead, so the
+/// signed app auto-streams (with retry-alive) the moment it launches. Stream parameters come from
+/// the environment (set by the LaunchAgent), with sane defaults. The plain CLI is unaffected:
+/// a bare `tinky-os` outside a bundle still prints help.
+func bundleStreamArgsIfLaunchedAsApp() -> Args? {
+    guard CommandLine.arguments.count < 2 else { return nil }
+    // Running inside `TinkyStream.app/Contents/MacOS/…`? Bundle.main has an .app path then.
+    let path = Bundle.main.bundlePath
+    guard path.hasSuffix(".app") else { return nil }
+    let env = ProcessInfo.processInfo.environment
+    let defaultOut = (env["HOME"].map { "\($0)/.kist/stream" }) ?? "/tmp/tinky-stream"
+    var opts: [String: String] = ["out": env["TINKY_STREAM_OUT"] ?? defaultOut]
+    if let v = env["TINKY_STREAM_FPS"] { opts["fps"] = v }
+    if let v = env["TINKY_STREAM_SCALE"] { opts["scale"] = v }
+    if let v = env["TINKY_STREAM_QUALITY"] { opts["quality"] = v }
+    if let v = env["TINKY_STREAM_RING"] { opts["ring"] = v }
+    return Args(cmd: "stream", opts: opts, flags: [])
+}
+
+let args = bundleStreamArgsIfLaunchedAsApp() ?? Args.parse(CommandLine.arguments)
 switch args.cmd {
 case "screenshot":   cmdScreenshot(args)
 case "click":        cmdClick(args)

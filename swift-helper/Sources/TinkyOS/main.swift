@@ -921,6 +921,74 @@ func cmdStream(_ args: Args) {
     dispatchMain()
 }
 
+// MARK: - Approvals refresh (Sequoia monthly nag suppressor)
+
+/// Push every Screen-Recording approval's next-nag date far into the future so macOS Sequoia's
+/// periodic re-authorization prompt never fires. The nag is keyed on a TIMESTAMP
+/// (`kScreenCapturePrivacyHintDate`, = lastAlerted + 30d) in the replayd group container — NOT on
+/// code signature — so pushing the date forward suppresses it. macOS rewrites the date on each
+/// capture, so a LaunchAgent must run this on a recurring schedule.
+///
+/// Runs INSIDE the TinkyStream.app bundle so it inherits the app's Full Disk Access grant (the
+/// group container is TCC-protected App-Data; a bare launchd process without FDA gets EPERM). This
+/// is why the refresh lives here and not in a standalone python launchd job.
+func cmdApprovalsRefresh(_ args: Args) {
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    let path = "\(home)/Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist"
+    // Optional substring filters: `approvals-refresh --only tinky` → only matching exec paths.
+    let onlyFilter = args.opts["only"]
+    // Far-future date: 2099-01-01 UTC.
+    var comps = DateComponents()
+    comps.year = 2099; comps.month = 1; comps.day = 1
+    comps.timeZone = TimeZone(identifier: "UTC")
+    guard let farFuture = Calendar(identifier: .gregorian).date(from: comps) else {
+        jsonErr("could not build far-future date")
+    }
+
+    guard FileManager.default.fileExists(atPath: path) else {
+        jsonOut(["ok": true, "refreshed": 0, "note": "approvals plist absent — nothing to refresh"])
+        exit(0)
+    }
+    guard let data = FileManager.default.contents(atPath: path) else {
+        jsonErr("cannot read approvals plist (Full Disk Access needed for this app?): \(path)", code: 5)
+    }
+    var format = PropertyListSerialization.PropertyListFormat.binary
+    guard var root = (try? PropertyListSerialization.propertyList(
+        from: data, options: [.mutableContainersAndLeaves], format: &format)) as? [String: Any] else {
+        jsonErr("approvals plist is not a dictionary", code: 5)
+    }
+
+    var refreshed = 0
+    for (execPath, value) in root {
+        guard var entry = value as? [String: Any] else { continue }
+        if let onlyFilter, !execPath.contains(onlyFilter) { continue }
+        let cur = entry["kScreenCapturePrivacyHintDate"] as? Date
+        if cur != farFuture {
+            entry["kScreenCapturePrivacyHintDate"] = farFuture
+            entry["kScreenCaptureApprovalLastAlerted"] = farFuture
+            root[execPath] = entry
+            refreshed += 1
+        }
+    }
+
+    if refreshed > 0 {
+        do {
+            let out = try PropertyListSerialization.data(
+                fromPropertyList: root, format: format, options: 0)
+            try out.write(to: URL(fileURLWithPath: path), options: .atomic)
+        } catch {
+            jsonErr("cannot write approvals plist: \(error.localizedDescription)", code: 5)
+        }
+        // Force replayd to reload the on-disk state (user agent — no sudo needed).
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        p.arguments = ["replayd"]
+        try? p.run(); p.waitUntilExit()
+    }
+    jsonOut(["ok": true, "refreshed": refreshed, "hintDate": "2099-01-01"])
+    exit(0)
+}
+
 // MARK: - Main
 
 /// When LaunchServices/launchd starts the `.app` bundle, the executable is invoked with NO
@@ -957,6 +1025,7 @@ case "find-text":      cmdFindText(args)
 case "ax-tree":        cmdAXTree(args)
 case "ax-check":       cmdAXCheck(args)
 case "stream":         cmdStream(args)
+case "approvals-refresh": cmdApprovalsRefresh(args)
 case "help", "--help", "-h":
     print("""
     tinky-os — macOS primitives for the Tinky Vision MCP bridge.

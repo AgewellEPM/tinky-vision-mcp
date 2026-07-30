@@ -167,7 +167,8 @@ disable security features.
    process. New target → new dialog. Server restart → re-approve.
 4. **Audit log.** Every tool call (success or failure) appended to
    `~/Library/Logs/tinky-vision-mcp/session.jsonl`. You can `tail -f`
-   it during a session.
+   it during a session. Set `TINKY_AUDIT_PATH` to an absolute per-process
+   `.jsonl` path when an isolated runner must not share that log.
 5. **`--read-only` mode.** Pass `--read-only` to disable all write
    tools at startup. The MCP host sees only the read tools.
 
@@ -232,3 +233,17 @@ MIT (the code). Your responsibility to use it safely (everything else).
 ## Made by
 
 Luke Kist · [Age Well Alliance / TinkyTown](https://tinkysales.vercel.app)
+
+## Deployment / no-drift (maintainers)
+
+Two dirs hold this code — do NOT edit both:
+
+- **Canonical (edit here):** `~/tinky-vision-mcp` (this repo, GitHub remote).
+- **Running (what `~/.mcp.json` launches):** `~/.kist/mcp/tinky-vision-mcp`.
+
+They are separate git repos. To stop them drifting (they once both shipped
+`v0.1.2` with different code — one missing the machine-freeze guard), the
+canonical repo's `post-commit`/`post-merge` hooks auto-run `tinky-vision-sync`,
+which copies the git-tracked files canonical → running (binaries in `bin/` and
+`node_modules/` are never touched). Manual: `tinky-vision-sync` to redeploy,
+`tinky-vision-sync check` to detect drift (exit 1 if any).

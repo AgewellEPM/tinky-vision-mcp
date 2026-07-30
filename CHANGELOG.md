@@ -4,6 +4,32 @@ All notable changes to **tinky-vision-mcp** are documented here. Format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
 
+## [0.1.4] — 2026-07-24
+
+### Fixed
+- Isolate audit-log tests with `TINKY_AUDIT_PATH`, preventing parallel test
+  processes from writing or rotating the same user log and causing false
+  safety failures.
+- Pin the tested MCP SDK and patched transitive dependency versions, including
+  its unused HTTP dependency chain. The MCP transport remains local stdio.
+
+## [0.1.3] — 2026-07-19
+
+### Security
+- **Self-substrate content guard (machine-freeze protection).** Hard,
+  consent-unbypassable refusal of any write whose payload is a self-restart of
+  the Kist runtime the agent lives in. Added after a 2026-07-09 incident where an
+  agent typed+approved `launchctl kickstart` on its own service and the
+  KeepAlive respawn loop froze the machine. Checks the cheap hot-path signals
+  (typed text + action label), not per-keystroke OCR.
+- Prefer the accessibility helper binary `bin/tinky-os-ax` when present, falling
+  back to `bin/tinky-os`; Swift helper (`main.swift`) gains the AX path.
+
+### Notes
+- Reconciles the deployed runtime copy (which carried the guard) back into this
+  canonical repo — both had drifted while sharing the `0.1.2` version string.
+  This is that fix, versioned honestly.
+
 ## [0.1.2] — 2026-05-19
 
 ### Added (operations)

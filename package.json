@@ -1,6 +1,6 @@
 {
   "name": "tinky-vision-mcp",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "MCP bridge for controlling legacy macOS apps via vision + accessibility. Lets Claude Desktop / Claude Code / any MCP client see + click + type in any app that doesn't natively speak MCP.",
   "type": "module",
   "bin": {
@@ -9,10 +9,16 @@
   "scripts": {
     "build:helper": "cd swift-helper && swift build -c release && cp .build/release/tinky-os ../bin/tinky-os",
     "start": "node src/server.mjs",
-    "test": "node --test tests/server.test.mjs"
+    "test": "node --test tests/server.test.mjs tests/control_inbox.test.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "1.29.0"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11",
+    "body-parser": "2.3.0",
+    "fast-uri": "4.1.1",
+    "hono": "4.12.32"
   },
   "engines": {
     "node": ">=20"

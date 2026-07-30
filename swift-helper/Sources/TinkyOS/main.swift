@@ -380,6 +380,147 @@ func cmdRaiseWindow(_ args: Args) {
     ])
 }
 
+// MARK: - Control inbox daemon
+//
+// The Kist console runs under launchd and therefore has NO Accessibility grant
+// (AX is attributed to the responsible parent — launchd, not a grant-holding
+// app), so any `control-click`/`move-window`/`raise-window` it spawns dies with
+// "Accessibility permission missing". This daemon is the fix: it runs INSIDE the
+// stable Developer-ID TinkyStream.app bundle as its own LaunchAgent, so it holds
+// the AX grant, and executes control requests the console drops into an inbox
+// directory. Exactly the same pattern TinkyStream already uses to hold the
+// Screen Recording grant for capture — here for Accessibility to drive windows.
+//
+// Protocol (file-based, atomic, no daemon deps):
+//   request : <inbox>/<id>.req.json  = {"op":"click|move|raise","windowID":N,
+//                                       "x":X,"y":Y,"double":bool}
+//   result  : <inbox>/<id>.res.json  = the executed result dict (ok/error/…)
+// The daemon writes the result atomically (tmp+rename) then deletes the request.
+// The console generates <id>, polls for <id>.res.json, and cleans it up.
+
+/// Execute a single control op WITHOUT exiting the process (unlike the cmd*
+/// wrappers, which jsonErr→exit). Returns a JSON-serialisable result dict.
+/// Fail-closed on a missing AX grant so the console surfaces the real reason
+/// instead of a silently-dropped synthetic click.
+func executeControlOp(op: String, windowID wid: CGWindowID, x: Double?, y: Double?, double: Bool) -> [String: Any] {
+    // Validate the op before anything else so a bad op is reported the same way
+    // regardless of grant state or whether the window is on screen.
+    guard ["click", "move", "raise"].contains(op) else {
+        return ["ok": false, "error": "unsupported control op: \(op)", "window": Int(wid)]
+    }
+    if !hasAccessibility() {
+        return ["ok": false, "error": "Accessibility permission missing",
+                "guard": "ax-grant-missing", "window": Int(wid)]
+    }
+    guard let info = windowInfo(forID: wid) else {
+        return ["ok": false, "error": "no on-screen window with id \(wid)", "window": Int(wid)]
+    }
+    switch op {
+    case "click":
+        guard let x, let y else {
+            return ["ok": false, "error": "click requires x and y", "window": Int(wid)]
+        }
+        postClickToPid(info.pid, at: CGPoint(x: x, y: y), double: double)
+        return ["ok": true, "mode": "targeted", "op": "click", "window": Int(wid),
+                "pid": Int(info.pid), "x": x, "y": y, "double": double]
+    case "move":
+        guard let x, let y else {
+            return ["ok": false, "error": "move requires x and y", "window": Int(wid)]
+        }
+        guard let match = axWindow(pid: info.pid, bounds: info.bounds), match.drift <= 40 else {
+            return ["ok": false, "error": "could not resolve AX window for id \(wid)", "window": Int(wid)]
+        }
+        var pos = CGPoint(x: x, y: y)
+        guard let axVal = AXValueCreate(.cgPoint, &pos) else {
+            return ["ok": false, "error": "failed to build AX position value", "window": Int(wid)]
+        }
+        let err = AXUIElementSetAttributeValue(match.element, kAXPositionAttribute as CFString, axVal)
+        if err != .success {
+            return ["ok": false, "error": "AXSetPosition failed (\(err.rawValue))", "window": Int(wid)]
+        }
+        return ["ok": true, "mode": "moved", "op": "move", "window": Int(wid),
+                "pid": Int(info.pid), "x": x, "y": y]
+    case "raise":
+        guard let match = axWindow(pid: info.pid, bounds: info.bounds), match.drift <= 40 else {
+            return ["ok": false, "error": "could not resolve AX window for id \(wid)", "window": Int(wid)]
+        }
+        let err = AXUIElementPerformAction(match.element, kAXRaiseAction as CFString)
+        return ["ok": err == .success, "mode": "raised", "op": "raise",
+                "window": Int(wid), "pid": Int(info.pid)]
+    default:
+        return ["ok": false, "error": "unsupported control op: \(op)", "window": Int(wid)]
+    }
+}
+
+/// Parse a request dict → executeControlOp. Kept separate so it is unit-testable
+/// without touching the filesystem.
+func handleControlRequest(_ req: [String: Any]) -> [String: Any] {
+    let op = ((req["op"] as? String) ?? "click").lowercased()
+    // windowID may arrive as Int or String depending on the JSON encoder.
+    let wid: CGWindowID?
+    if let n = req["windowID"] as? Int { wid = CGWindowID(n) }
+    else if let s = req["windowID"] as? String, let n = UInt32(s) { wid = CGWindowID(n) }
+    else if let d = req["windowID"] as? Double { wid = CGWindowID(d) }
+    else { wid = nil }
+    guard let wid, wid > 0 else {
+        return ["ok": false, "error": "valid windowID is required"]
+    }
+    func num(_ k: String) -> Double? {
+        if let d = req[k] as? Double { return d }
+        if let n = req[k] as? Int { return Double(n) }
+        if let s = req[k] as? String, let d = Double(s) { return d }
+        return nil
+    }
+    let double = (req["double"] as? Bool) ?? false
+    return executeControlOp(op: op, windowID: wid, x: num("x"), y: num("y"), double: double)
+}
+
+func cmdControlInbox(_ args: Args) {
+    guard let dir = args.opts["dir"] else {
+        jsonErr("--dir <inbox> required")
+    }
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let pollSeconds = Double(args.opts["poll"] ?? "") ?? 0.08
+    // Startup line → launchd stdout log; confirms the grant-holder is live.
+    jsonOut(["ok": true, "event": "control-inbox-started", "dir": dir,
+             "accessibility": hasAccessibility()])
+    fflush(stdout)  // non-TTY under launchd is block-buffered; flush so the log shows liveness
+    while true {
+        let names = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+        // Oldest-first by name; ids are time-sortable so this preserves order.
+        for name in names.filter({ $0.hasSuffix(".req.json") }).sorted() {
+            let reqPath = (dir as NSString).appendingPathComponent(name)
+            let id = String(name.dropLast(".req.json".count))
+            var result: [String: Any]
+            if let data = fm.contents(atPath: reqPath),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                result = handleControlRequest(obj)
+            } else {
+                result = ["ok": false, "error": "unreadable or malformed request"]
+            }
+            result["id"] = id
+            writeResultAtomically(dir: dir, id: id, result: result)
+            try? fm.removeItem(atPath: reqPath)
+        }
+        Thread.sleep(forTimeInterval: pollSeconds)
+    }
+}
+
+func writeResultAtomically(dir: String, id: String, result: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) else { return }
+    let finalPath = (dir as NSString).appendingPathComponent("\(id).res.json")
+    let tmpPath = (dir as NSString).appendingPathComponent(".\(id).res.json.tmp")
+    do {
+        try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
+        // rename is atomic within a dir → a reader never sees a half-written result.
+        try? FileManager.default.removeItem(atPath: finalPath)
+        try FileManager.default.moveItem(atPath: tmpPath, toPath: finalPath)
+    } catch {
+        try? FileManager.default.removeItem(atPath: tmpPath)
+    }
+}
+
 // MARK: - Type text
 
 func cmdType(_ args: Args) {
@@ -1278,6 +1419,7 @@ case "window-info":  cmdWindowInfo(args)
 case "control-click": cmdControlClick(args)
 case "move-window":  cmdMoveWindow(args)
 case "raise-window": cmdRaiseWindow(args)
+case "control-inbox": cmdControlInbox(args)
 case "type":         cmdType(args)
 case "key":          cmdKey(args)
 case "apps":           cmdApps(args)
@@ -1308,6 +1450,14 @@ case "help", "--help", "-h":
              # --exclude-app writes a second see-through frame (seethrough-latest.jpg)
              # with those apps excluded from the composite — invisible in the mirror,
              # untouched on the real screen. latest.jpg stays the full frame.
+      window-info --window <CGWindowID>
+      control-click --window <id> --x <int> --y <int> [--double]
+      move-window --window <id> --x <int> --y <int>
+      raise-window --window <id> [--activate]
+      control-inbox --dir <inbox> [--poll <seconds>]
+             # grant-holder daemon: executes control ops the launchd console
+             # drops as <id>.req.json, writes <id>.res.json. Runs inside
+             # TinkyStream.app so it holds the Accessibility grant.
     """)
 default:
     jsonErr("Unknown command '\(args.cmd)'. Run `tinky-os help`.")

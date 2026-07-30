@@ -318,11 +318,37 @@ func cmdControlClick(_ args: Args) {
     }
     let pt = CGPoint(x: x, y: y)
     let isDouble = args.flags.contains("double")
-    postClickToPid(info.pid, at: pt, double: isDouble)
+    let method = targetedClick(info.pid, at: pt, double: isDouble)
     jsonOut([
-        "ok": true, "mode": "targeted", "window": Int(wid), "pid": Int(info.pid),
+        "ok": true, "mode": "targeted", "method": method, "window": Int(wid), "pid": Int(info.pid),
         "x": x, "y": y, "double": isDouble,
     ])
+}
+
+/// Z-order-independent click. Prefer an Accessibility PRESS on the element at
+/// the point: AXUIElementCopyElementAtPosition on the app element returns the
+/// control at (x,y) WITHIN that app regardless of what's visually on top or
+/// whether the app is key — and AXPress fires the control's action directly.
+/// This is what makes a click land on a window sitting behind Chrome, and it
+/// works on Catalyst/SwiftUI apps (e.g. modern Calculator) that ignore synthetic
+/// mouse events. Fall back to a synthetic mouse post for double-clicks and for
+/// elements that expose no AXPress (drag handles, canvases, custom views).
+func targetedClick(_ pid: pid_t, at pt: CGPoint, double: Bool) -> String {
+    if !double, axPressAtPoint(pid: pid, x: Float(pt.x), y: Float(pt.y)) {
+        return "ax-press"
+    }
+    postClickToPid(pid, at: pt, double: double)
+    return "synthetic"
+}
+
+/// AXPress the element under a global point within a specific app. Returns true
+/// only if an element was found AND its press action succeeded.
+func axPressAtPoint(pid: pid_t, x: Float, y: Float) -> Bool {
+    let app = AXUIElementCreateApplication(pid)
+    var element: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(app, x, y, &element) == .success,
+          let element else { return false }
+    return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
 }
 
 func postClickToPid(_ pid: pid_t, at pt: CGPoint, double: Bool) {
@@ -431,8 +457,8 @@ func executeControlOp(op: String, windowID wid: CGWindowID, x: Double?, y: Doubl
         guard let x, let y else {
             return ["ok": false, "error": "click requires x and y", "window": Int(wid)]
         }
-        postClickToPid(info.pid, at: CGPoint(x: x, y: y), double: double)
-        return ["ok": true, "mode": "targeted", "op": "click", "window": Int(wid),
+        let method = targetedClick(info.pid, at: CGPoint(x: x, y: y), double: double)
+        return ["ok": true, "mode": "targeted", "method": method, "op": "click", "window": Int(wid),
                 "pid": Int(info.pid), "x": x, "y": y, "double": double]
     case "move":
         guard let x, let y else {

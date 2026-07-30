@@ -61,7 +61,7 @@ test("control-inbox honors the request/result protocol for every error path", as
     return;
   }
   const dir = mkdtempSync(join(tmpdir(), "tinky-inbox-"));
-  const daemon = spawn(BIN, ["control-inbox", "--dir", dir, "--poll", "0.03"], {
+  const daemon = spawn(BIN, ["control-inbox", "--dir", dir, "--poll", "0.03", "--no-prompt"], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {
@@ -91,7 +91,7 @@ test("control-inbox tolerates a malformed (non-JSON) request", async (t) => {
     return;
   }
   const dir = mkdtempSync(join(tmpdir(), "tinky-inbox-bad-"));
-  const daemon = spawn(BIN, ["control-inbox", "--dir", dir, "--poll", "0.03"], {
+  const daemon = spawn(BIN, ["control-inbox", "--dir", dir, "--poll", "0.03", "--no-prompt"], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {

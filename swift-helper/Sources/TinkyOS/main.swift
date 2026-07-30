@@ -117,6 +117,17 @@ func requireAccessibility() {
     }
 }
 
+/// Trigger the system "…would like to control this computer using accessibility
+/// features" prompt. Calling the prompting variant of the trust check also
+/// REGISTERS this code identity in the Accessibility list (unchecked) so the
+/// user can flip it on in System Settings even if they dismiss the dialog.
+/// No-op (returns true, no prompt) once the grant is already held.
+@discardableResult
+func promptAccessibility() -> Bool {
+    let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+    return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+}
+
 // MARK: - Screenshot
 
 func cmdScreenshot(_ args: Args) {
@@ -482,9 +493,16 @@ func cmdControlInbox(_ args: Args) {
     let fm = FileManager.default
     try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
     let pollSeconds = Double(args.opts["poll"] ?? "") ?? 0.08
+    // If the grant is missing, surface the system prompt AND register this app
+    // in the Accessibility list so the user can grant it from Settings. Skip when
+    // --no-prompt is passed (tests / headless).
+    let granted = hasAccessibility()
+    if !granted && !args.flags.contains("no-prompt") {
+        promptAccessibility()
+    }
     // Startup line → launchd stdout log; confirms the grant-holder is live.
     jsonOut(["ok": true, "event": "control-inbox-started", "dir": dir,
-             "accessibility": hasAccessibility()])
+             "accessibility": granted])
     fflush(stdout)  // non-TTY under launchd is block-buffered; flush so the log shows liveness
     while true {
         let names = (try? fm.contentsOfDirectory(atPath: dir)) ?? []

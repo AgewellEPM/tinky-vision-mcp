@@ -341,6 +341,18 @@ func targetedClick(_ pid: pid_t, at pt: CGPoint, double: Bool) -> String {
     return "synthetic"
 }
 
+/// Bring a window forward robustly. AXRaise alone no-ops on some Catalyst/
+/// SwiftUI apps, so also set the window main and activate the owning app.
+/// Returns (raisedViaAX, activatedApp) — the caller treats either as success.
+func raiseWindow(_ window: AXUIElement, pid: pid_t) -> (raised: Bool, activated: Bool) {
+    var raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success
+    if AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue) == .success {
+        raised = true
+    }
+    let activated = NSRunningApplication(processIdentifier: pid)?.activate(options: []) ?? false
+    return (raised, activated)
+}
+
 /// AXPress the element under a global point within a specific app. Returns true
 /// only if an element was found AND its press action succeeded.
 func axPressAtPoint(pid: pid_t, x: Float, y: Float) -> Bool {
@@ -407,13 +419,10 @@ func cmdRaiseWindow(_ args: Args) {
     guard let match = axWindow(pid: info.pid, bounds: info.bounds), match.drift <= 40 else {
         jsonErr("could not resolve AX window for id \(wid)")
     }
-    let err = AXUIElementPerformAction(match.element, kAXRaiseAction as CFString)
-    if args.flags.contains("activate") {
-        NSRunningApplication(processIdentifier: info.pid)?.activate(options: [])
-    }
+    let (raised, activated) = raiseWindow(match.element, pid: info.pid)
     jsonOut([
-        "ok": err == .success, "mode": "raised", "window": Int(wid), "pid": Int(info.pid),
-        "activated": args.flags.contains("activate"),
+        "ok": raised || activated, "mode": "raised", "window": Int(wid), "pid": Int(info.pid),
+        "raised": raised, "activated": activated,
     ])
 }
 
@@ -481,9 +490,9 @@ func executeControlOp(op: String, windowID wid: CGWindowID, x: Double?, y: Doubl
         guard let match = axWindow(pid: info.pid, bounds: info.bounds), match.drift <= 40 else {
             return ["ok": false, "error": "could not resolve AX window for id \(wid)", "window": Int(wid)]
         }
-        let err = AXUIElementPerformAction(match.element, kAXRaiseAction as CFString)
-        return ["ok": err == .success, "mode": "raised", "op": "raise",
-                "window": Int(wid), "pid": Int(info.pid)]
+        let (raised, activated) = raiseWindow(match.element, pid: info.pid)
+        return ["ok": raised || activated, "mode": "raised", "op": "raise",
+                "raised": raised, "activated": activated, "window": Int(wid), "pid": Int(info.pid)]
     default:
         return ["ok": false, "error": "unsupported control op: \(op)", "window": Int(wid)]
     }

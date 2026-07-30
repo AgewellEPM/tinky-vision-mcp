@@ -5,3 +5,6 @@ bin/tinky-os
 *.log
 .DS_Store
 bin/tinky-os-ax
+
+# Built app bundle (produced by build-tinkystream-app.sh)
+swift-helper/TinkyStream.app/

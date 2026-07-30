@@ -795,6 +795,11 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
     private let dir: URL
     private let ring: Int
     private let quality: CGFloat
+    // Output basename (e.g. "latest.jpg" for the full mirror, "seethrough-latest.jpg"
+    // for the Chrome-excluded see-through mirror). Lets one process run two streams
+    // to two distinct frame files without clobbering each other.
+    private let latestName: String
+    private let tmpName: String
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     // Written on the sample queue, read from the heartbeat loop. Int reads of a
@@ -803,10 +808,13 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
     private(set) var frames: Int = 0
     private(set) var writeFailures: Int = 0
 
-    init(dir: URL, ring: Int, quality: CGFloat) {
+    init(dir: URL, ring: Int, quality: CGFloat, latestName: String = "latest.jpg") {
         self.dir = dir
         self.ring = ring
         self.quality = quality
+        self.latestName = latestName
+        // Distinct tmp per output so the two streams' atomic writes never race.
+        self.tmpName = ".\(latestName).tmp"
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -822,8 +830,8 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
             writeFailures += 1
             return
         }
-        let tmp = dir.appendingPathComponent(".latest.tmp")
-        let latest = dir.appendingPathComponent("latest.jpg")
+        let tmp = dir.appendingPathComponent(tmpName)
+        let latest = dir.appendingPathComponent(latestName)
         do {
             try jpeg.write(to: tmp)
             _ = try FileManager.default.replaceItemAt(latest, withItemAt: tmp)
@@ -847,6 +855,96 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// Build the capture filter for a display. With no exclusions this is the plain
+// full-display filter (unchanged behavior). With `excludeBundleIDs` set, exclude
+// every window belonging to those apps at the APPLICATION level — so newly opened
+// windows of the same app stay excluded and ScreenCaptureKit composites the
+// display AS IF those apps don't exist, revealing whatever is behind them. This is
+// the see-through mirror: Chrome vanishes from the frame while staying fully real
+// and interactive on the actual screen.
+func makeFilter(display: SCDisplay, content: SCShareableContent,
+                excludeBundleIDs: Set<String>) -> SCContentFilter {
+    if excludeBundleIDs.isEmpty {
+        return SCContentFilter(display: display, excludingWindows: [])
+    }
+    // Case-insensitive: Chrome's real bundle ID is "com.google.Chrome" (capital C),
+    // so a case-sensitive match silently excludes nothing.
+    let wanted = Set(excludeBundleIDs.map { $0.lowercased() })
+    let apps = content.applications.filter { wanted.contains($0.bundleIdentifier.lowercased()) }
+    if apps.isEmpty {
+        // Target apps not running yet — nothing to exclude this cycle; a later
+        // refresh picks them up the moment they launch.
+        return SCContentFilter(display: display, excludingWindows: [])
+    }
+    return SCContentFilter(display: display, excludingApplications: apps, exceptingWindows: [])
+}
+
+// One retry-alive capture loop writing to `sink`. Optionally excludes apps
+// (see-through). When excluding, the filter is refreshed on each heartbeat so
+// target apps launching/quitting after start are still handled.
+func runStream(sink: StreamSink, label: String, outDir: String,
+               fps: Int, scale: Double, ring: Int,
+               excludeBundleIDs: Set<String>,
+               hold: @escaping (SCStream) -> Void) async {
+    var attempt = 0
+    while true {
+        attempt += 1
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false, onScreenWindowsOnly: false)
+            guard let display = content.displays.first else {
+                throw NSError(domain: "tinky.stream", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "no capturable display yet"])
+            }
+            let config = SCStreamConfiguration()
+            config.width = max(64, Int(Double(display.width) * scale))
+            config.height = max(64, Int(Double(display.height) * scale))
+            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.queueDepth = 5
+            config.showsCursor = true
+            let filter = makeFilter(display: display, content: content,
+                                    excludeBundleIDs: excludeBundleIDs)
+            let stream = SCStream(filter: filter, configuration: config, delegate: sink)
+            try stream.addStreamOutput(
+                sink, type: .screen,
+                sampleHandlerQueue: DispatchQueue(label: "tinky.stream.sample.\(label)"))
+            try await stream.startCapture()
+            hold(stream) // lifetime anchor held by caller
+            jsonOut(["ok": true, "streaming": true, "stream": label, "dir": outDir,
+                     "fps": fps, "scale": scale, "ring": ring,
+                     "excludes": Array(excludeBundleIDs).sorted(),
+                     "width": config.width, "height": config.height,
+                     "grantedAfterAttempts": attempt])
+            fflush(stdout)
+            while true {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                jsonOut(["ok": true, "heartbeat": true, "stream": label,
+                         "frames": sink.frames, "writeFailures": sink.writeFailures])
+                fflush(stdout)
+                // Refresh the exclusion filter so Chrome windows opened after the
+                // stream started are still excluded (and quit ones stop being).
+                if !excludeBundleIDs.isEmpty,
+                   let fresh = try? await SCShareableContent.excludingDesktopWindows(
+                       false, onScreenWindowsOnly: false),
+                   let disp = fresh.displays.first {
+                    let refreshed = makeFilter(display: disp, content: fresh,
+                                               excludeBundleIDs: excludeBundleIDs)
+                    try? await stream.updateContentFilter(refreshed)
+                }
+            }
+        } catch {
+            // Stay alive through the permission prompt; do NOT exit.
+            jsonOut(["ok": false, "awaitingPermission": true, "stream": label,
+                     "attempt": attempt,
+                     "hint": "Grant Screen Recording to this app, then it streams automatically",
+                     "error": error.localizedDescription])
+            fflush(stdout)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+}
+
 func cmdStream(_ args: Args) {
     guard let outDir = args.opts["out"] else {
         jsonErr("stream requires --out <dir>")
@@ -855,6 +953,16 @@ func cmdStream(_ args: Args) {
     let scale = min(1.0, max(0.1, Double(args.opts["scale"] ?? "0.5") ?? 0.5))
     let quality = min(1.0, max(0.1, Double(args.opts["quality"] ?? "0.6") ?? 0.6))
     let ring = max(0, Int(args.opts["ring"] ?? "0") ?? 0)
+    // See-through: apps to make invisible in a SECOND frame (seethrough-latest.jpg).
+    // Comma-separated bundle IDs; empty disables the second stream. The primary
+    // latest.jpg is ALWAYS the full frame so Chrome vision/task paths keep working.
+    let excludeBundleIDs = Set(
+        (args.opts["exclude-app"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty })
+    // A slower see-through fps keeps two concurrent captures light on the GPU.
+    let seethroughFps = max(1, min(fps, Int(args.opts["seethrough-fps"] ?? "8") ?? 8))
     let dir = URL(fileURLWithPath: outDir, isDirectory: true)
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -862,60 +970,25 @@ func cmdStream(_ args: Args) {
         jsonErr("cannot create --out dir \(outDir): \(error.localizedDescription)")
     }
 
-    let sink = StreamSink(dir: dir, ring: ring, quality: CGFloat(quality))
-    // Retain the stream for the process lifetime; released only at exit.
-    var retainedStream: SCStream?
+    // Retain both streams for process lifetime; released only at exit.
+    var retained: [SCStream] = []
+    let retainLock = NSLock()
+    let hold: (SCStream) -> Void = { s in
+        retainLock.lock(); retained.append(s); retainLock.unlock()
+    }
 
+    let primary = StreamSink(dir: dir, ring: ring, quality: CGFloat(quality))
     Task {
-        // Retry-alive: the FIRST capture attempt triggers the macOS Screen
-        // Recording prompt and fails until the user grants it. Instead of
-        // exiting, we stay alive and retry every 2s — so the app survives the
-        // prompt, and the instant the user clicks Allow, streaming begins with
-        // no relaunch. This is what makes a .app-bundle grant actually land.
-        var attempt = 0
-        while true {
-            attempt += 1
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(
-                    false, onScreenWindowsOnly: false)
-                guard let display = content.displays.first else {
-                    throw NSError(domain: "tinky.stream", code: 3, userInfo: [
-                        NSLocalizedDescriptionKey: "no capturable display yet"])
-                }
-                let config = SCStreamConfiguration()
-                config.width = max(64, Int(Double(display.width) * scale))
-                config.height = max(64, Int(Double(display.height) * scale))
-                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-                config.pixelFormat = kCVPixelFormatType_32BGRA
-                config.queueDepth = 5
-                config.showsCursor = true
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let stream = SCStream(filter: filter, configuration: config, delegate: sink)
-                try stream.addStreamOutput(
-                    sink, type: .screen,
-                    sampleHandlerQueue: DispatchQueue(label: "tinky.stream.sample"))
-                try await stream.startCapture()
-                retainedStream = stream
-                _ = retainedStream // lifetime anchor
-                jsonOut(["ok": true, "streaming": true, "dir": outDir, "fps": fps,
-                         "scale": scale, "quality": quality, "ring": ring,
-                         "width": config.width, "height": config.height,
-                         "grantedAfterAttempts": attempt])
-                fflush(stdout)
-                while true {
-                    try await Task.sleep(nanoseconds: 5_000_000_000)
-                    jsonOut(["ok": true, "heartbeat": true, "frames": sink.frames,
-                             "writeFailures": sink.writeFailures])
-                    fflush(stdout)
-                }
-            } catch {
-                // Stay alive through the permission prompt; do NOT exit.
-                jsonOut(["ok": false, "awaitingPermission": true, "attempt": attempt,
-                         "hint": "Grant Screen Recording to this app, then it streams automatically",
-                         "error": error.localizedDescription])
-                fflush(stdout)
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
+        await runStream(sink: primary, label: "full", outDir: outDir, fps: fps,
+                        scale: scale, ring: ring, excludeBundleIDs: [], hold: hold)
+    }
+    if !excludeBundleIDs.isEmpty {
+        let seethrough = StreamSink(dir: dir, ring: 0, quality: CGFloat(quality),
+                                    latestName: "seethrough-latest.jpg")
+        Task {
+            await runStream(sink: seethrough, label: "seethrough", outDir: outDir,
+                            fps: seethroughFps, scale: scale, ring: 0,
+                            excludeBundleIDs: excludeBundleIDs, hold: hold)
         }
     }
     dispatchMain()
@@ -1009,6 +1082,11 @@ func bundleStreamArgsIfLaunchedAsApp() -> Args? {
     if let v = env["TINKY_STREAM_SCALE"] { opts["scale"] = v }
     if let v = env["TINKY_STREAM_QUALITY"] { opts["quality"] = v }
     if let v = env["TINKY_STREAM_RING"] { opts["ring"] = v }
+    // See-through mirror on by default: exclude Chrome from a second frame
+    // (seethrough-latest.jpg). Override with TINKY_STREAM_EXCLUDE_APPS (set to
+    // "" to disable, or a comma-separated bundle-ID list to change targets).
+    opts["exclude-app"] = env["TINKY_STREAM_EXCLUDE_APPS"] ?? "com.google.chrome"
+    if let v = env["TINKY_STREAM_SEETHROUGH_FPS"] { opts["seethrough-fps"] = v }
     return Args(cmd: "stream", opts: opts, flags: [])
 }
 
@@ -1042,6 +1120,10 @@ case "help", "--help", "-h":
       ax-tree [--all] [--app <bundleID>] [--pid <int>] [--max <int>] [--depth <int>]
       ax-check
       stream --out <dir> [--fps <1-60>] [--scale <0.1-1>] [--quality <0.1-1>] [--ring <n>]
+             [--exclude-app <bundleID,…>] [--seethrough-fps <1-60>]
+             # --exclude-app writes a second see-through frame (seethrough-latest.jpg)
+             # with those apps excluded from the composite — invisible in the mirror,
+             # untouched on the real screen. latest.jpg stays the full frame.
     """)
 default:
     jsonErr("Unknown command '\(args.cmd)'. Run `tinky-os help`.")

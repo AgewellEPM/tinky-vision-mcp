@@ -72,13 +72,13 @@ async function withServer({ env = {}, args = [] } = {}, fn) {
   };
 
   // Always initialize first.
-  await call(1, 'initialize', {
+  const initialize = await call(1, 'initialize', {
     protocolVersion: '2024-11-05', capabilities: {},
     clientInfo: { name: 'test', version: '0' },
   });
 
   try {
-    return await fn({ call });
+    return await fn({ call, initialize });
   } finally {
     srv.kill();
   }
@@ -90,18 +90,22 @@ function toolResult(resp) {
   try { return JSON.parse(text); } catch { return { _text: text }; }
 }
 
-test('server boots and exposes the expected 9 tools', async () => {
-  await withServer({}, async ({ call }) => {
+test('server boots and exposes the expected 12 tools', async () => {
+  await withServer({}, async ({ call, initialize }) => {
+    assert.equal(initialize?.result?.serverInfo?.version, '0.1.4');
     const list = await call(2, 'tools/list');
     const tools = list?.result?.tools ?? [];
     const names = tools.map(t => t.name).sort();
     assert.deepEqual(names, [
       'os_ax_check',
       'os_click',
+      'os_control_click',
       'os_find_window',
       'os_focused_window',
       'os_key',
       'os_list_apps',
+      'os_move_window',
+      'os_raise_window',
       'os_screenshot',
       'os_type',
       'vision_find_text',
@@ -187,6 +191,8 @@ test('auto-approve allows os_click when focused app is benign', async () => {
     });
     assert.equal(click?.result?.isError, undefined, 'should succeed');
     const r = toolResult(click);
+    assert.match(r.auditReceipt?.eventId || '', /^\d+-\d+-\d+$/);
+    assert.equal(typeof r.auditReceipt?.logFile, 'string');
     assert.equal(r.ok, true);
     assert.equal(r.fake, true);
     assert.equal(r.sub, 'click');
@@ -298,29 +304,117 @@ test('SEC: approval cache is keyed by observed bundle, not by AI-claimed target 
   });
 });
 
+// ── controller (targeted, z-order-independent) write path ──
+// The critical invariant: the deny-list + consent for these tools point at
+// the TARGET window's app, NOT the frontmost app. Under the controller model
+// the frontmost app is the mirror host (Chrome), so a frontmost-based check
+// would fail OPEN — an agent could drive a password manager behind a benign
+// Chrome tab. Per the multi-site rule, EVERY controller write tool asserts
+// this individually so a missed sibling can't silently regress.
+const CONTROLLER_WRITES = [
+  { name: 'os_control_click', args: { windowID: 42, x: 5, y: 5 } },
+  { name: 'os_move_window',   args: { windowID: 42, x: 5, y: 5 } },
+  { name: 'os_raise_window',  args: { windowID: 42 } },
+];
+
+for (const { name, args } of CONTROLLER_WRITES) {
+  test(`SEC: ${name} blocks when the TARGET window is a deny-listed app (frontmost is benign)`, async () => {
+    await withServer({
+      env: {
+        TINKY_AUTO_APPROVE: '1',
+        // Frontmost app is SAFE — proving the check does NOT rely on it.
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.google.Chrome',
+        // The targeted window belongs to a password manager.
+        TINKY_FAKE_TARGET_BUNDLE: 'com.1password.1password',
+      },
+    }, async ({ call }) => {
+      const r = await call(2, 'tools/call', {
+        name,
+        arguments: { ...args, target: 'sneaky', description: 'drive hidden window' },
+      });
+      assert.equal(r?.result?.isError, true, `${name} MUST block a deny-listed target`);
+      assert.match(r?.result?.content?.[0]?.text || '', /deny-list/i,
+        `${name} error should name the deny-list`);
+    });
+  });
+
+  test(`SEC: ${name} fails closed when the target window's app cannot be identified`, async () => {
+    await withServer({
+      env: {
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.google.Chrome',
+        TINKY_FAKE_TARGET_MISSING: '1',
+      },
+    }, async ({ call }) => {
+      const r = await call(2, 'tools/call', {
+        name,
+        arguments: { ...args, target: 'X', description: 'Y' },
+      });
+      assert.equal(r?.result?.isError, true, `${name} MUST fail closed on unknown target`);
+      assert.match(r?.result?.content?.[0]?.text || '', /cannot resolve|cannot identify|DENIED/i);
+    });
+  });
+
+  test(`SEC: ${name} is blocked in --read-only mode`, async () => {
+    await withServer({ args: ['--read-only'], env: { TINKY_AUTO_APPROVE: '1' } }, async ({ call }) => {
+      const r = await call(2, 'tools/call', {
+        name,
+        arguments: { ...args, target: 'X', description: 'Y' },
+      });
+      assert.equal(r?.result?.isError, true, `${name} must be denied in read-only`);
+      assert.match(r?.result?.content?.[0]?.text || '', /read-only/i);
+    });
+  });
+
+  test(`${name} succeeds against a benign target with auto-approve`, async () => {
+    await withServer({
+      env: {
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.google.Chrome',
+        TINKY_FAKE_TARGET_BUNDLE: 'com.apple.TextEdit',
+      },
+    }, async ({ call }) => {
+      const r = await call(2, 'tools/call', {
+        name,
+        arguments: { ...args, target: 'TextEdit', description: 'drive it' },
+      });
+      assert.equal(r?.result?.isError, undefined, `${name} should succeed against a benign target`);
+      const parsed = toolResult(r);
+      assert.equal(parsed.ok, true);
+      assert.equal(parsed.fake, true);
+    });
+  });
+}
+
 test('OPS: TINKY_AUDIT_DISABLE=1 suppresses log writes entirely', async () => {
   // v0.1.2 — environments that don't want any audit trail (CI,
   // automated test rigs, ephemeral containers) can opt out cleanly.
-  const { readFileSync, existsSync } = await import('node:fs');
+  const { readFileSync, existsSync, mkdtempSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
-  const { homedir } = await import('node:os');
-  const logPath = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp', 'session.jsonl');
+  const { tmpdir } = await import('node:os');
+  const auditDir = mkdtempSync(join(tmpdir(), 'tinky-audit-disabled-'));
+  const logPath = join(auditDir, 'session.jsonl');
   const before = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
-  await withServer({
-    env: {
-      TINKY_AUTO_APPROVE: '1',
-      TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
-      TINKY_AUDIT_DISABLE: '1',
-    },
-  }, async ({ call }) => {
-    await call(2, 'tools/call', { name: 'os_screenshot', arguments: {} });
-    await call(3, 'tools/call', {
-      name: 'os_type',
-      arguments: { text: 'should-not-be-logged', target: 'X', description: 'Y' },
+  try {
+    await withServer({
+      env: {
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+        TINKY_AUDIT_DISABLE: '1',
+        TINKY_AUDIT_PATH: logPath,
+      },
+    }, async ({ call }) => {
+      await call(2, 'tools/call', { name: 'os_screenshot', arguments: {} });
+      await call(3, 'tools/call', {
+        name: 'os_type',
+        arguments: { text: 'should-not-be-logged', target: 'X', description: 'Y' },
+      });
     });
-  });
-  const after = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
-  assert.equal(after, before, 'AUDIT_DISABLE=1 must not append any bytes to the log');
+    const after = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
+    assert.equal(after, before, 'AUDIT_DISABLE=1 must not append any bytes to the log');
+  } finally {
+    rmSync(auditDir, { recursive: true, force: true });
+  }
 });
 
 test('OPS: audit log rotates when size exceeds TINKY_AUDIT_ROTATE_MAX', async () => {
@@ -329,36 +423,42 @@ test('OPS: audit log rotates when size exceeds TINKY_AUDIT_ROTATE_MAX', async ()
   // (env TINKY_TEST_ROTATE_EVERY_CALL bypasses the 100-call defer).
   // Run enough write tool calls to overflow + verify an archive
   // appeared in the log directory.
-  const { readdirSync, existsSync, writeFileSync, mkdirSync, statSync } = await import('node:fs');
+  const {
+    readdirSync, existsSync, writeFileSync, mkdtempSync, statSync, rmSync,
+  } = await import('node:fs');
   const { join } = await import('node:path');
-  const { homedir } = await import('node:os');
-  const dir = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp');
-  mkdirSync(dir, { recursive: true });
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'tinky-audit-rotate-'));
   const logPath = join(dir, 'session.jsonl');
   // Pre-fill log to ~2KB so the first rotate check overflows the 1KB
   // threshold regardless of the 100-call defer.
   writeFileSync(logPath, 'x'.repeat(2048) + '\n');
   const beforeArchives = readdirSync(dir).filter(f => /^session\..+\.jsonl$/.test(f));
-  await withServer({
-    env: {
-      TINKY_AUTO_APPROVE: '1',
-      TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
-      TINKY_AUDIT_ROTATE_MAX: '1024',
-      TINKY_AUDIT_KEEP_FILES: '99',
-    },
-  }, async ({ call }) => {
-    // First call triggers the rotate check (counter=1 in our impl
-    // means rotate runs on first call, then skips for 99, then re-checks).
-    await call(2, 'tools/call', { name: 'os_focused_window', arguments: {} });
-  });
-  const afterArchives = readdirSync(dir).filter(f => /^session\..+\.jsonl$/.test(f));
-  assert.ok(afterArchives.length > beforeArchives.length,
-    `expected new archive after rotation; before=${beforeArchives.length} after=${afterArchives.length}`);
-  // session.jsonl should exist and be smaller than the threshold
-  // (or just contain the one new entry).
-  assert.ok(existsSync(logPath), 'fresh session.jsonl should exist post-rotation');
-  assert.ok(statSync(logPath).size < 1024,
-    `fresh log should be < threshold; got ${statSync(logPath).size}`);
+  try {
+    await withServer({
+      env: {
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+        TINKY_AUDIT_ROTATE_MAX: '1024',
+        TINKY_AUDIT_KEEP_FILES: '99',
+        TINKY_AUDIT_PATH: logPath,
+      },
+    }, async ({ call }) => {
+      // First call triggers the rotate check (counter=1 in our impl
+      // means rotate runs on first call, then skips for 99, then re-checks).
+      await call(2, 'tools/call', { name: 'os_focused_window', arguments: {} });
+    });
+    const afterArchives = readdirSync(dir).filter(f => /^session\..+\.jsonl$/.test(f));
+    assert.ok(afterArchives.length > beforeArchives.length,
+      `expected new archive after rotation; before=${beforeArchives.length} after=${afterArchives.length}`);
+    // session.jsonl should exist and be smaller than the threshold
+    // (or just contain the one new entry).
+    assert.ok(existsSync(logPath), 'fresh session.jsonl should exist post-rotation');
+    assert.ok(statSync(logPath).size < 1024,
+      `fresh log should be < threshold; got ${statSync(logPath).size}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('SEC: audit log redacts os_type "text" payload (Codex HIGH#1)', async () => {
@@ -366,31 +466,35 @@ test('SEC: audit log redacts os_type "text" payload (Codex HIGH#1)', async () =>
   // to prove the cleartext never landed. The fake helper accepts
   // anything, so the only difference between the on-disk log and the
   // input is the redaction logic.
-  const { readFileSync, existsSync } = await import('node:fs');
+  const { readFileSync, existsSync, mkdtempSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
-  const { homedir } = await import('node:os');
-  const logPath = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp', 'session.jsonl');
+  const { tmpdir } = await import('node:os');
+  const auditDir = mkdtempSync(join(tmpdir(), 'tinky-audit-redaction-'));
+  const logPath = join(auditDir, 'session.jsonl');
   const beforeSize = existsSync(logPath) ? readFileSync(logPath, 'utf8').length : 0;
   const SENTINEL = 'PA55w0rd-DO-NOT-PERSIST-9X8Y7Z';
 
-  await withServer({
-    env: {
-      TINKY_AUTO_APPROVE: '1',
-      TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
-    },
-  }, async ({ call }) => {
-    const r = await call(2, 'tools/call', {
-      name: 'os_type',
-      arguments: { text: SENTINEL, target: 'Safari', description: 'fill password field' },
+  try {
+    await withServer({
+      env: {
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+        TINKY_AUDIT_PATH: logPath,
+      },
+    }, async ({ call }) => {
+      const r = await call(2, 'tools/call', {
+        name: 'os_type',
+        arguments: { text: SENTINEL, target: 'Safari', description: 'fill password field' },
+      });
+      assert.equal(r?.result?.isError, undefined, 'type should succeed via auto-approve');
     });
-    assert.equal(r?.result?.isError, undefined, 'type should succeed via auto-approve');
-  });
 
-  // Inspect only the audit lines written during this test (skip prior
-  // bytes — earlier tests may have appended their own entries).
-  const after = readFileSync(logPath, 'utf8').slice(beforeSize);
-  assert.equal(after.includes(SENTINEL), false,
-    'AUDIT LOG MUST NOT contain the cleartext text payload');
-  assert.match(after, new RegExp(`REDACTED:${SENTINEL.length}ch`),
-    'audit log should include a typed-length redaction marker');
+    const after = readFileSync(logPath, 'utf8').slice(beforeSize);
+    assert.equal(after.includes(SENTINEL), false,
+      'AUDIT LOG MUST NOT contain the cleartext text payload');
+    assert.match(after, new RegExp(`REDACTED:${SENTINEL.length}ch`),
+      'audit log should include a typed-length redaction marker');
+  } finally {
+    rmSync(auditDir, { recursive: true, force: true });
+  }
 });

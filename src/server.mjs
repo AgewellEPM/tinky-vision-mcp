@@ -85,8 +85,13 @@ const HELPER_BIN = process.env.TINKY_HELPER_BIN ||
   (existsSync(resolve(__dirname, '..', 'bin', 'tinky-os-ax'))
     ? resolve(__dirname, '..', 'bin', 'tinky-os-ax')
     : resolve(__dirname, '..', 'bin', 'tinky-os'));
-const LOG_DIR = join(homedir(), 'Library', 'Logs', 'tinky-vision-mcp');
-const LOG_FILE = join(LOG_DIR, 'session.jsonl');
+const DEFAULT_LOG_FILE = join(
+  homedir(), 'Library', 'Logs', 'tinky-vision-mcp', 'session.jsonl',
+);
+// Tests and isolated operators can route one server process to its own log.
+// The default remains the established user-visible location.
+const LOG_FILE = resolve(process.env.TINKY_AUDIT_PATH || DEFAULT_LOG_FILE);
+const LOG_DIR = dirname(LOG_FILE);
 const READ_ONLY = process.argv.includes('--read-only');
 
 // AUTO_APPROVE bypasses the osascript dialog. Used by `npm test` and by
@@ -235,14 +240,24 @@ function rotateIfNeeded() {
 }
 
 function audit(entry) {
-  if (AUDIT_DISABLED) return;
+  if (AUDIT_DISABLED) return null;
   const safe = { ...entry };
   if (safe.args) safe.args = redactArgsForAudit(safe.tool, safe.args);
-  const line = JSON.stringify({ ts: Date.now(), ...safe }) + '\n';
+  const ts = Date.now();
+  audit._counter = (audit._counter || 0) + 1;
+  const eventId = `${ts}-${process.pid}-${audit._counter}`;
+  const event = { ts, eventId, ...safe };
+  const line = JSON.stringify(event) + '\n';
   try {
     rotateIfNeeded();
     appendFileSync(LOG_FILE, line);
-  } catch { /* silent */ }
+    return { eventId, ts, logFile: LOG_FILE };
+  } catch {
+    // A missing audit receipt must be visible to callers. The tool action may
+    // already have occurred, so return an explicit unavailable marker rather
+    // than pretending there is durable evidence.
+    return { eventId, ts, logFile: LOG_FILE, durable: false };
+  }
 }
 
 // ────────────────────────── helper invocation ──────────────────────────
@@ -404,6 +419,49 @@ function guardedWrite(toolName, target, description) {
   return observedBundle;
 }
 
+/// Resolve a CGWindowID to its owning app identity + bounds via the helper.
+/// Throws if the window is gone (fail-closed: never act on a stale ID).
+function resolveWindow(windowID) {
+  const r = callHelper('window-info', ['--window', String(windowID)]);
+  if (!r || r.ok !== true) {
+    throw new Error(`cannot resolve window ${windowID}: ${r?.error || 'not on screen'}`);
+  }
+  return r;   // { pid, bundleID, owner, title, bounds }
+}
+
+/// Guard for CONTROLLER (targeted) write tools. The critical difference vs
+/// guardedWrite: the deny-list + consent are pointed at the TARGET window's
+/// app — NOT the frontmost app. Under the controller model the frontmost
+/// app is the mirror host (e.g. Chrome), while the click actually lands in
+/// the targeted window's process, so checking frontmost would be a
+/// fail-OPEN hole (agent clicks 1Password behind a safe Chrome tab). We
+/// fail-closed on an unknown target bundle for the same reason.
+function guardedTargetWrite(toolName, windowID, target, description) {
+  if (READ_ONLY) throw new Error('Write tools disabled (--read-only).');
+  const info = resolveWindow(windowID);
+  const bundleID = info.bundleID || '';
+  if (!bundleID) {
+    audit({ tool: toolName, deny: true, reason: 'target-bundle-unknown', windowID });
+    throw new Error(
+      `DENIED: cannot identify the app owning window ${windowID}; blocking ` +
+      `targeted write (fail-closed) because the sensitive-app deny-list ` +
+      `cannot be verified against an unknown target.`
+    );
+  }
+  if (DENY_BUNDLES.has(bundleID)) {
+    audit({ tool: toolName, deny: true, target: bundleID, windowID });
+    throw new Error(
+      `DENIED: target window ${windowID} belongs to ${bundleID}, on the ` +
+      `sensitive-app deny-list. Controller writes are blocked against ` +
+      `password managers / auth prompts regardless of z-order.`
+    );
+  }
+  if (!requestConsent(target || info.owner, description, bundleID)) {
+    throw new Error(`User denied consent for ${toolName}.`);
+  }
+  return info;
+}
+
 // ────────────────────────── tool defs ──────────────────────────
 
 const TOOLS = [
@@ -499,6 +557,51 @@ const TOOLS = [
     },
   },
   {
+    name: 'os_control_click',
+    description: 'CONTROLLER click: click a SPECIFIC window by CGWindowID, delivered to that window\'s process regardless of z-order. Unlike os_click, the target does NOT need to be frontmost — use this to drive a window sitting behind a mirror host (e.g. the Chrome console). x/y are GLOBAL screen coords. WRITE action — consent + sensitive-app deny-list are enforced against the TARGET window\'s app, not the frontmost app. Get windowID from os_find_window.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        windowID: { type: 'integer', description: 'CGWindowID of the target window (from os_find_window).' },
+        x: { type: 'integer', description: 'Global screen X pixel of the click point.' },
+        y: { type: 'integer', description: 'Global screen Y pixel of the click point.' },
+        double: { type: 'boolean', description: 'If true, double-click.' },
+        target: { type: 'string', description: 'Required consent label (e.g. "Battle.net Login").' },
+        description: { type: 'string', description: 'Required short summary of what this click does.' },
+      },
+      required: ['windowID', 'x', 'y', 'target', 'description'],
+    },
+  },
+  {
+    name: 'os_move_window',
+    description: 'CONTROLLER move: reposition a window (by CGWindowID) to a new top-left via Accessibility — a real move of the actual window, regardless of z-order. This is "drag it around" for a mirror. WRITE action — consent + deny-list enforced against the target window\'s app.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        windowID: { type: 'integer', description: 'CGWindowID of the target window.' },
+        x: { type: 'integer', description: 'New global top-left X.' },
+        y: { type: 'integer', description: 'New global top-left Y.' },
+        target: { type: 'string', description: 'Required consent label.' },
+        description: { type: 'string', description: 'Required short summary.' },
+      },
+      required: ['windowID', 'x', 'y', 'target', 'description'],
+    },
+  },
+  {
+    name: 'os_raise_window',
+    description: 'CONTROLLER raise: bring a specific window (by CGWindowID) to the front of its app via Accessibility, optionally activating the owning app. Targeted, so it does not disturb the mirror host beyond the requested window. WRITE action — consent + deny-list enforced against the target window\'s app.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        windowID: { type: 'integer', description: 'CGWindowID of the target window.' },
+        activate: { type: 'boolean', description: 'If true, also activate (focus) the owning application.' },
+        target: { type: 'string', description: 'Required consent label.' },
+        description: { type: 'string', description: 'Required short summary.' },
+      },
+      required: ['windowID', 'target', 'description'],
+    },
+  },
+  {
     name: 'os_ax_check',
     description: 'Check whether the tinky-os helper has Accessibility permission. Returns { accessibility: true|false }. Call this first if click/type/key are failing — without Accessibility, they silently no-op at the OS level.',
     inputSchema: { type: 'object', properties: {} },
@@ -532,7 +635,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: 'tinky-vision-mcp',
-    version: '0.1.3',
+    version: '0.1.4',
   },
   {
     capabilities: { tools: {} },
@@ -588,6 +691,32 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         result = callHelper('key', argv);
         break;
       }
+      case 'os_control_click': {
+        { const sub = substrateContentRefusal(args.description, args.target); if (sub) throw new Error(sub); }
+        guardedTargetWrite('os_control_click', args.windowID, args.target,
+          `os_control_click(win=${args.windowID}, x=${args.x}, y=${args.y}${args.double ? ', double' : ''}): ${args.description}`);
+        const argv = ['--window', String(args.windowID), '--x', String(args.x), '--y', String(args.y)];
+        if (args.double) argv.push('--double');
+        result = callHelper('control-click', argv);
+        break;
+      }
+      case 'os_move_window': {
+        { const sub = substrateContentRefusal(args.description, args.target); if (sub) throw new Error(sub); }
+        guardedTargetWrite('os_move_window', args.windowID, args.target,
+          `os_move_window(win=${args.windowID} → x=${args.x}, y=${args.y}): ${args.description}`);
+        result = callHelper('move-window',
+          ['--window', String(args.windowID), '--x', String(args.x), '--y', String(args.y)]);
+        break;
+      }
+      case 'os_raise_window': {
+        { const sub = substrateContentRefusal(args.description, args.target); if (sub) throw new Error(sub); }
+        guardedTargetWrite('os_raise_window', args.windowID, args.target,
+          `os_raise_window(win=${args.windowID}${args.activate ? ', activate' : ''}): ${args.description}`);
+        const argv = ['--window', String(args.windowID)];
+        if (args.activate) argv.push('--activate');
+        result = callHelper('raise-window', argv);
+        break;
+      }
       case 'os_ax_check':
         // The helper exits 1 when permission is missing — callHelper
         // throws in that case. Catch + return the JSON instead so the
@@ -608,7 +737,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-    audit({ tool: name, args, ok: true, ms: Date.now() - startedAt });
+    const auditReceipt = audit({ tool: name, args, ok: true, ms: Date.now() - startedAt });
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      result = { ...result, auditReceipt };
+    }
     return {
       content: [{ type: 'text', text: JSON.stringify(result) }],
     };

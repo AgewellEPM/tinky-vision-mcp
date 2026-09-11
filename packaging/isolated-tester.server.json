@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.AgewellEPM/isolated-tester",
   "title": "IsolatedTester \u2014 TinkyVision system",
-  "description": "Isolated macOS app sessions, MCP images, OCR/ASCII frames, accessibility and test reports. Apple silicon, macOS 14+.",
+  "description": "Isolated macOS app tests, MCP images, OCR/ASCII frames, accessibility and evidence reports.",
   "repository": {
     "url": "https://github.com/AgewellEPM/tinky-vision-mcp",
     "source": "github"

@@ -6,6 +6,15 @@ Screen understanding and isolated app testing over MCP. Connect an AI assistant 
 
 **Early-access release 0.2.0.** The packages target Apple silicon Macs running macOS 14 or later. This project is independently developed; an Anthropic listing or endorsement is not claimed. Clean-install Claude Desktop UI acceptance remains pending. See [release validation](docs/RELEASE-VALIDATION.md).
 
+## Published MCP Registry entries
+
+Both companion servers are active in the [official MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.AgewellEPM):
+
+- `io.github.AgewellEPM/tinkyvision` — version `0.2.0`
+- `io.github.AgewellEPM/isolated-tester` — version `1.2.1`
+
+The Registry entries reference the versioned GitHub MCPB assets and their SHA-256 checksums. Registry publication is separate from Anthropic's directory review; the Anthropic form submission is still pending.
+
 ## Install
 
 Download the two companion extensions from [the 0.2.0 release](https://github.com/AgewellEPM/tinky-vision-mcp/releases/tag/v0.2.0):

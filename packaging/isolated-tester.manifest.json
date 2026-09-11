@@ -1,0 +1,48 @@
+{
+  "manifest_version": "0.3",
+  "author": {
+    "name": "Luke Kist / TinkyBink",
+    "url": "https://github.com/AgewellEPM"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgewellEPM/tinky-vision-mcp.git"
+  },
+  "homepage": "https://github.com/AgewellEPM/tinky-vision-mcp",
+  "documentation": "https://github.com/AgewellEPM/tinky-vision-mcp/blob/v0.2.0/README.md",
+  "support": "https://github.com/AgewellEPM/tinky-vision-mcp/issues",
+  "privacy_policies": [
+    "https://github.com/AgewellEPM/tinky-vision-mcp/blob/v0.2.0/PRIVACY.md",
+    "https://www.anthropic.com/legal/privacy",
+    "https://openai.com/policies/privacy-policy/"
+  ],
+  "icon": "icon.png",
+  "license": "MIT",
+  "tools_generated": true,
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  },
+  "keywords": [
+    "mcp",
+    "accessibility",
+    "ocr",
+    "testing"
+  ],
+  "name": "isolated-tester",
+  "display_name": "IsolatedTester \u2014 TinkyVision system",
+  "version": "1.2.1",
+  "description": "Isolated macOS app sessions, MCP images, OCR/ASCII frames, accessibility and test reports. Apple silicon, macOS 14+.",
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/isolated-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/bin/isolated-mcp",
+      "args": [],
+      "env": {
+        "IST_FRAME_CAPACITY": "300"
+      }
+    }
+  }
+}

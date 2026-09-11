@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AgewellEPM/tinkyvision",
+  "title": "TinkyVision",
+  "description": "Screen observation, OCR and permission-controlled app input over MCP for Apple silicon Macs.",
+  "repository": {
+    "url": "https://github.com/AgewellEPM/tinky-vision-mcp",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "websiteUrl": "https://github.com/AgewellEPM/tinky-vision-mcp",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/AgewellEPM/tinky-vision-mcp/v0.2.0/assets/icon.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "512x512"
+      ]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/AgewellEPM/tinky-vision-mcp/releases/download/v0.2.0/tinkyvision-0.2.0-macos-arm64.mcpb",
+      "fileSha256": "14976c5744f981191bf7f961da9af2537dd5c01a8037a31ea60ac5f3a0d5ca1f",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "manifest_version": "0.3",
+  "author": {
+    "name": "Luke Kist / TinkyBink",
+    "url": "https://github.com/AgewellEPM"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgewellEPM/tinky-vision-mcp.git"
+  },
+  "homepage": "https://github.com/AgewellEPM/tinky-vision-mcp",
+  "documentation": "https://github.com/AgewellEPM/tinky-vision-mcp/blob/v0.2.0/README.md",
+  "support": "https://github.com/AgewellEPM/tinky-vision-mcp/issues",
+  "privacy_policies": [
+    "https://github.com/AgewellEPM/tinky-vision-mcp/blob/v0.2.0/PRIVACY.md"
+  ],
+  "icon": "icon.png",
+  "license": "MIT",
+  "tools_generated": true,
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "node": ">=20"
+    }
+  },
+  "keywords": [
+    "mcp",
+    "accessibility",
+    "ocr",
+    "testing"
+  ],
+  "name": "tinkyvision",
+  "display_name": "TinkyVision \u2014 Luke Kist / TinkyBink",
+  "version": "0.2.0",
+  "description": "Screen observation, OCR and permission-controlled app input over MCP for Apple silicon Macs.",
+  "server": {
+    "type": "node",
+    "entry_point": "src/server.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/src/server.mjs"
+      ],
+      "env": {
+        "TINKY_READ_ONLY": "${user_config.read_only}"
+      }
+    }
+  },
+  "user_config": {
+    "read_only": {
+      "type": "boolean",
+      "title": "Read-only mode",
+      "description": "Block input and new control grants. Revocation remains available.",
+      "default": true
+    }
+  }
+}

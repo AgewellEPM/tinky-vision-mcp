@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AgewellEPM/isolated-tester",
+  "title": "IsolatedTester \u2014 TinkyVision system",
+  "description": "Isolated macOS app sessions, MCP images, OCR/ASCII frames, accessibility and test reports. Apple silicon, macOS 14+.",
+  "repository": {
+    "url": "https://github.com/AgewellEPM/tinky-vision-mcp",
+    "source": "github"
+  },
+  "version": "1.2.1",
+  "websiteUrl": "https://github.com/AgewellEPM/tinky-vision-mcp",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/AgewellEPM/tinky-vision-mcp/v0.2.0/assets/icon.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "512x512"
+      ]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/AgewellEPM/tinky-vision-mcp/releases/download/v0.2.0/isolated-tester-1.2.1-macos-arm64.mcpb",
+      "fileSha256": "d2f9e67bf6b772e2685cff0d8bfb58786a0e442bf910e99a21216dc89dccb5ba",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

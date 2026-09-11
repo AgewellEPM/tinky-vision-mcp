@@ -1,249 +1,64 @@
-# tinky-vision-mcp
+# TinkyVision + IsolatedTester
 
-**v0.1.1 — PILOT-READY for vision + non-sensitive automation. Treat
-it like sudo for your screen.**
+**Created by Luke Kist / TinkyBink · [AgewellEPM](https://github.com/AgewellEPM)**
 
-This server CAN click anywhere and type anything on your Mac. Three
-hard gates run on every write action, in order, before anything
-moves:
+Screen understanding and isolated app testing over MCP. Connect an AI assistant to macOS applications through screenshots, on-device OCR, accessibility elements, and explicit input tools. IsolatedTester adds virtual-display app sessions, ASCII frames for text-only models, bounded visual history, and evidence reports.
 
-1. **Read-only mode** (`--read-only`) — disables all write tools
-2. **Sensitive-app deny-list** — hard policy block when 1Password,
-   Bitwarden, LastPass, Dashlane, Keychain, SecurityAgent, Touch-ID
-   prompt, Terminal, iTerm, Screen Sharing, or System Settings is the
-   focused app. **Fails closed**: if the helper can't identify focus
-   for any reason (helper crash, no app frontmost, etc.) the write is
-   blocked, not allowed. Cannot be opted past inside a session.
-3. **Per-(target × observed bundle) consent dialog** — first call per
-   pair pops a native macOS dialog. Approval is keyed on observed
-   bundle + AI-claimed target, so a Safari approval does NOT auto-
-   extend to a different app even if the agent reuses the same
-   `target` string.
-
-The audit log at `~/Library/Logs/tinky-vision-mcp/session.jsonl`
-records every call. `os_type` `text` payloads are redacted to
-`[REDACTED:Nch]` before write — passwords typed through the helper
-never land on disk in plaintext.
-
-These three layers + the audit redaction were added in v0.1.1 after
-a 4-round Codex security review. Run `npm test` to see the 13-test
-suite that locks them.
-
-**Still not in scope**: signed binary distribution, audit-log
-rotation, real-app hardware smoke. That's why this is PILOT-READY
-not PRODUCTION-READY. Don't run against accounts you can't afford to
-lose.
-
-Local [Model Context Protocol](https://modelcontextprotocol.io/) server
-that bridges modern AI clients (Claude Desktop, Claude Code, Cursor,
-any MCP host) to **legacy macOS apps** that have no native AI API.
-
-The legacy app has no idea it's being driven by an AI. It just sees a
-fast human moving the mouse and typing on the keyboard.
-
-```
-┌─────────────────┐   stdio    ┌──────────────────┐   spawn   ┌──────────┐
-│ Claude Desktop  │◄─JSON-RPC─►│ tinky-vision-mcp │──────────►│ tinky-os │
-│ (or any MCP     │            │ (Node.js server) │           │ (Swift)  │
-│  client)        │            └──────────────────┘           └────┬─────┘
-└─────────────────┘                                                │
-                                                                   ▼
-                                                       CGEvent · AX · screencapture
-                                                                   │
-                                                                   ▼
-                                                          ANY macOS app
-                                                          (1998 or 2026)
-```
-
-## Tools
-
-| Tool | Side effect | Description |
-|---|---|---|
-| `os_screenshot` | read-only | PNG of screen or specific app window |
-| `os_list_apps` | read-only | All running regular `.app` processes with bundle IDs |
-| `os_find_window` | read-only | Search visible windows by title/owner substring |
-| `os_focused_window` | read-only | Frontmost app's bundle ID + key-window bounds |
-| `vision_find_text` | read-only | On-device OCR (macOS Vision) over the screen; returns text + clickable coords |
-| `os_ax_check` | read-only | Is Accessibility permission granted? |
-| `os_click` | **write** | Synthetic mouse click at screen coords |
-| `os_type` | **write** | Type text at currently-focused field |
-| `os_key` | **write** | Press a key with optional Cmd/Shift/Opt/Ctrl |
-
-Every write tool runs through three gates, in order:
-1. **Read-only check** — server started with `--read-only` blocks all writes
-2. **Sensitive-app deny-list** — hard policy block when the focused window
-   belongs to 1Password / Bitwarden / LastPass / Dashlane / Keychain /
-   SecurityAgent / Touch-ID prompt / Terminal / iTerm / Screen Sharing /
-   System Settings. Cannot be opted past inside a session. Extend via the
-   `TINKY_DENY_BUNDLES` env var (colon-separated).
-3. **Consent dialog** — first call per `target` per session pops a native
-   macOS dialog showing the AI's described action AND the observed
-   focused-app bundle (so target/reality mismatches are visible).
-
-The deny-list is intentionally stricter than the consent prompt because
-prompt-injection attacks teach AIs to lie about what they're doing.
-Policy blocks the action before the dialog ever shows.
+**Early-access release 0.2.0.** The packages target Apple silicon Macs running macOS 14 or later. This project is independently developed; an Anthropic listing or endorsement is not claimed. Clean-install Claude Desktop UI acceptance remains pending. See [release validation](docs/RELEASE-VALIDATION.md).
 
 ## Install
 
-```bash
-git clone https://github.com/AgewellEPM/tinky-vision-mcp.git
-cd tinky-vision-mcp
-npm install
-npm run build:helper   # builds the Swift CLI + copies to bin/
-npm test               # run the 10-test policy + integration suite
-```
+Download the two companion extensions from [the 0.2.0 release](https://github.com/AgewellEPM/tinky-vision-mcp/releases/tag/v0.2.0):
 
-### Grant Accessibility to the helper
+- **tinkyvision-0.2.0-macos-arm64.mcpb** — screen capture, OCR, window discovery, scoped accessibility, and consent-gated control. Includes the Swift helpers and Node dependencies; Claude Desktop supplies Node.
+- **isolated-tester-1.2.1-macos-arm64.mcpb** — isolated app sessions, screenshots, OCR/ASCII frames, accessibility, input, recording controls, and reports. Includes its native MCP executable.
 
-The first time you call `os_click` / `os_type` / `os_key` the call
-will fail with an Accessibility error. Open
-**System Settings → Privacy & Security → Accessibility**, click `+`,
-and add `bin/tinky-os` from this repo. Toggle it ON.
+Install both through Claude Desktop's extension installation UI. Grant the requested macOS Screen Recording and Accessibility permissions to the relevant executables; permissions are machine-specific and cannot be bundled. TinkyVision starts in read-only mode by default; change its extension setting only when input control is intended. IsolatedTester exposes input tools whose use must be authorized by the operator.
 
-If you rebuild the helper, the binary path changes — you may need to
-remove the old entry and re-add the new one. (Yes, this is a macOS
-TCC quirk, not our bug.)
+The native artifacts are intended for Apple silicon. Intel, Windows-hosted, and Linux-hosted execution are not claimed. Windows guests require separately installed Perslis/GhostBridge and the exact licensed guest disk. Guest images are not distributed here.
 
-### Wire into Claude Desktop
+Other MCP clients can extract the bundles and run the TinkyVision `src/server.mjs` with Node 20+ or the IsolatedTester `bin/isolated-mcp` executable over stdio. MCPB installation support varies by client.
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+## What the model receives
 
-```json
-{
-  "mcpServers": {
-    "tinky-vision": {
-      "command": "node",
-      "args": [
-        "/Users/YOU/tinky-vision-mcp/src/server.mjs"
-      ]
-    }
-  }
-}
-```
+| Need | Tools |
+|---|---|
+| An image directly through MCP | `os_screenshot_image`, `session_image`, `portal_snapshot` |
+| Recognized text and positions | `vision_find_text`, `ocr_frame` |
+| Structured interface elements | `os_ax_snapshot`, `get_accessibility_tree`, `get_interactive_elements` |
+| A spatial view for text-only models | `ascii_frame` |
+| Captures saved on the Mac | `os_screenshot`, `session_frame`, `screenshot` |
+| Inspect and manage isolated sessions | `setup_status`, `list_sessions`, `create_session`, `stop_session` |
+| Review recorded evidence | `frame_history`, `seal_session`, `session_report`, `trend_report` |
 
-For a **read-only** server (no write tools loaded at all — useful for
-"just look at my screen and tell me what you see"):
+A text-only model receives text representations, not native image perception. A file path is distinct from an MCP image response. Client configuration determines whether image/text results are sent to a hosted model.
 
-```json
-"args": ["/Users/YOU/tinky-vision-mcp/src/server.mjs", "--read-only"]
-```
+## First session
 
-Restart Claude Desktop. You should see `tinky-vision` in the MCP
-servers panel.
+1. Check `setup_status` and existing sessions. Run at most one isolated app or VM session.
+2. Create a session for a disposable native test app, with a clear objective.
+3. Observe through `session_image`, OCR, or accessibility before selecting input targets.
+4. Verify the result through a fresh observation.
+5. Stop the session in guaranteed cleanup and verify that its owned app/helpers are gone.
 
-### Wire into Claude Code
+Keep continuous capture at or below 1 FPS and retain the 300-frame recycler. TinkyStream capture is available in the included helper/source; the extensions do not install a background recording service. GhostBridge portal tools require a separately configured active portal. They fail when that dependency is absent.
 
-```bash
-claude mcp add tinky-vision -- node /Users/YOU/tinky-vision-mcp/src/server.mjs
-```
+## Permissions and boundaries
 
-## Security model
+TinkyVision preserves its sensitive-app deny list, read-only control, self-protection checks, native consent, and audit logging. Scoped accessibility grants bind to a specific window and expire. Read-only mode does not mean a tool has no privacy implications: screenshots and UI text can contain private information.
 
-This is the part to read.
+IsolatedTester places an app on a virtual display. This is UI isolation, not a filesystem, network, or operating-system security sandbox. The app and tools retain their OS-level permissions. An arbitrary click can activate a destructive application action. Tool annotations describe effects and do not replace operator authorization.
 
-### What this server CAN do
+## Privacy Policy
 
-- See every pixel on your screen (via `os_screenshot`)
-- Click anywhere on your screen (via `os_click`)
-- Type anything into the focused field (via `os_type`)
-- Press any key combo (via `os_key`)
+Read the [Privacy Policy](PRIVACY.md) before connecting a client. It explains screen data, model-provider sharing, local logs, recordings, retention, and deletion. Optional autonomous tests can call Anthropic or OpenAI using the operator's credentials.
 
-Combined: an attacker with control of the AI client can exfiltrate
-data, send messages as you, drain accounts, install software, or
-disable security features.
+## Credit and citation
 
-### What protects you
+Please credit **Luke Kist / TinkyBink (AgewellEPM)** and link this repository when demonstrating or building on the system. Use [CITATION.cff](CITATION.cff) for a versioned software citation. Preserve the included notices for IsolatedTester contributors and third-party dependencies.
 
-1. **Accessibility permission must be granted manually.** macOS will
-   not let `tinky-os` send synthetic input without your explicit OK
-   in System Settings. Without it, every write tool silently no-ops.
-2. **Per-target consent dialog on first action.** When the AI tries
-   to click in Photoshop for the first time, you see a native macOS
-   dialog: *"Claude wants to click the Play button on Steve's World.
-   Approve once / Approve session / Deny."* You can deny.
-3. **Per-target session scope.** "Approve session" approves further
-   actions against THAT TARGET ONLY for the lifetime of the server
-   process. New target → new dialog. Server restart → re-approve.
-4. **Audit log.** Every tool call (success or failure) appended to
-   `~/Library/Logs/tinky-vision-mcp/session.jsonl`. You can `tail -f`
-   it during a session. Set `TINKY_AUDIT_PATH` to an absolute per-process
-   `.jsonl` path when an isolated runner must not share that log.
-5. **`--read-only` mode.** Pass `--read-only` to disable all write
-   tools at startup. The MCP host sees only the read tools.
+## Source and support
 
-### What does NOT protect you
+TinkyVision is MIT licensed; native helpers and build sources are in this repository. IsolatedTester is distributed with its MIT notice as a companion binary. [Support and bug reports](https://github.com/AgewellEPM/tinky-vision-mcp/issues). Do not post private screenshots, API keys, or session recordings in public issues.
 
-- The AI itself. If the AI is jailbroken or prompt-injected (e.g. by
-  a webpage you asked it to read), it WILL try to abuse these tools.
-  The consent dialog is the only thing between you and that.
-- Approving "session" without thinking. "Approve session" is a fire-
-  and-forget grant — you won't see another dialog for that target
-  until the server restarts. Use "Approve once" if you're paranoid.
-- Reading data. Screenshots are unprompted (read-only ≠ harmless).
-  Don't run this with a 1Password window open and visible.
-
-### Recommendations
-
-- Keep `--read-only` on by default. Turn write mode on only when you
-  need it.
-- Quit the server (or kill Claude Desktop) when you're not actively
-  driving an app. The session approval list dies with the process.
-- Review `~/Library/Logs/tinky-vision-mcp/session.jsonl` periodically.
-- Don't run this on a machine that holds keys to anything you can't
-  afford to lose. This is a prototype.
-
-## Architecture
-
-`src/server.mjs` — Node.js MCP server. Owns:
-- MCP JSON-RPC over stdio
-- Tool registration + dispatch
-- Consent gate (osascript dialog)
-- Audit log (jsonl append)
-
-`swift-helper/Sources/TinkyOS/main.swift` — Swift CLI. Owns:
-- `screencapture` invocation
-- `CGEvent` posting (clicks + key presses)
-- `AXIsProcessTrusted` checks
-- `CGWindowList` enumeration
-- `NSWorkspace.runningApplications`
-
-The split exists because:
-- Node has the most mature MCP SDK
-- Swift gets us the lowest-friction path to macOS primitives
-- Communicating over stdin/stdout (one spawn per tool call) is
-  cheap enough for human-paced agent action loops
-
-## Building
-
-```bash
-# helper
-cd swift-helper && swift build -c release
-# OR from the repo root:
-npm run build:helper
-```
-
-The Swift binary lands at `bin/tinky-os` — that's the path
-`src/server.mjs` looks for at startup.
-
-## License
-
-MIT (the code). Your responsibility to use it safely (everything else).
-
-## Made by
-
-Luke Kist · [Age Well Alliance / TinkyTown](https://tinkysales.vercel.app)
-
-## Deployment / no-drift (maintainers)
-
-Two dirs hold this code — do NOT edit both:
-
-- **Canonical (edit here):** `~/tinky-vision-mcp` (this repo, GitHub remote).
-- **Running (what `~/.mcp.json` launches):** `~/.kist/mcp/tinky-vision-mcp`.
-
-They are separate git repos. To stop them drifting (they once both shipped
-`v0.1.2` with different code — one missing the machine-freeze guard), the
-canonical repo's `post-commit`/`post-merge` hooks auto-run `tinky-vision-sync`,
-which copies the git-tracked files canonical → running (binaries in `bin/` and
-`node_modules/` are never touched). Manual: `tinky-vision-sync` to redeploy,
-`tinky-vision-sync check` to detect drift (exit 1 if any).
+Maintainer packaging and submission details: [release guide](docs/RELEASING.md), [reviewer instructions](docs/REVIEWER-GUIDE.md).

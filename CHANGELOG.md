@@ -1,8 +1,63 @@
+# 0.2.0 — 2026-09-11
+
+- Publish companion MCPB packages for TinkyVision and IsolatedTester with Luke Kist / TinkyBink attribution and versioned citation metadata.
+- Add titles and effect annotations to both MCP tool catalogs.
+- Add direct MCP image tools while preserving existing local-file screenshot tools.
+- Bundle the native helpers and Node dependencies; sign native release binaries with Developer ID.
+- Add privacy policy, reviewer guide, validation notes and Registry descriptors.
+- Preserve existing scoped-accessibility and GhostBridge/TinkyStream functionality in the release source.
+- Early access: clean-install Claude Desktop UI acceptance and Anthropic submission remain pending.
+
 # Changelog
 
 All notable changes to **tinky-vision-mcp** are documented here. Format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/).
+
+## [Unreleased]
+
+### Added
+- TinkyStream can preserve the full physical-display feed as chronological,
+  timestamped five-minute H.264 MP4 segments alongside JSON manifests while
+  retaining the existing 1-FPS, 300-frame live JPEG recycler.
+
+### Fixed
+- Recover a ScreenCaptureKit lane in-process after macOS stops it instead of
+  immediately racing OS teardown through launchd. A lock-aware 45-second
+  first-frame watchdog now provides a bounded process restart if a fresh
+  ScreenCaptureKit request wedges, and retired streams are released.
+
+### Safety
+- Persistent screen history is stored in owner-only folders and files. It is
+  never silently pruned; archival pauses at a configurable free-space reserve
+  while live vision continues normally.
+
+## [0.1.6] — 2026-08-14
+
+### Added
+- `portal_state` now includes the approval-gated compositor handoff phase,
+  supervisor heartbeat, owned process IDs, recovery message, and run-log path.
+- During the narrow truth-to-portal transition, `portal_state` continues to
+  return the handoff record even before `portal-state.json` exists, so AI
+  observers can distinguish intentional startup from lost visibility.
+
+### Safety
+- Handoff JSON receives the same bounded, regular-file, same-owner, schema
+  validation as the established portal state and frame records.
+
+## [0.1.5] — 2026-08-14
+
+### Added
+- `portal_state` exposes the active GhostBridge portal's source identity,
+  lifecycle, health, frame/heartbeat freshness, focus owner, pointer location,
+  held buttons/keys, modifiers, and direct/composed vision paths.
+- `portal_snapshot` returns portal-only, exact composed left+right, or full
+  physical TinkyStream vision as an MCP image with the complete state record.
+
+### Security
+- Portal and composed images are accepted only when their SHA-256 matches an
+  atomic frame metadata record. Reads reject symlinks, non-owner files,
+  malformed schemas, oversized files, and mismatched frame/metadata pairs.
 
 ## [0.1.4] — 2026-07-24
 

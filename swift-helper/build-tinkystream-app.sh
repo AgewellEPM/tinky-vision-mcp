@@ -48,8 +48,8 @@ cat > "$OUT_APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>${EXEC_NAME}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleShortVersionString</key><string>1.1</string>
-  <key>CFBundleVersion</key><string>1.1</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
+  <key>CFBundleVersion</key><string>1.2</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>TinkyStream captures the desktop so Kist vision can see the screen live.</string>

@@ -14,8 +14,10 @@
 //                                                                       ▼
 //                                                                  CGEvent / AX / screencapture
 //
-// Tools exposed (9 total, all macOS-host-only):
+// Tools exposed (16 total, all macOS-host-only):
 //   read-only:
+//     portal_state         portal source/session/focus/input/health heartbeat
+//     portal_snapshot      verified composed/full TinkyStream image
 //     os_screenshot        capture screen or app window
 //     os_list_apps         enumerate running regular .app processes
 //     os_find_window       search visible windows by title/owner
@@ -55,19 +57,25 @@
 // ~100 tool calls is cheap, and off-by-N around the threshold is
 // harmless.
 //
-// LABEL: v0.1.3 — PILOT-READY for vision + non-sensitive automation.
-// 15/15 tests green (3 functional + 3 SEC regressions + 2 OPS rotation
-// + 7 detection). Still needs signed binary distribution + real-app
-// hardware smoke before PRODUCTION-READY.
+// LABEL: v0.1.7 — PILOT-READY for vision, session-bound remote control,
+// and authenticated remote file transfer. Still needs signed distribution +
+// real-app hardware smoke before PRODUCTION-READY.
 
 import { spawn, execFileSync } from 'node:child_process';
 import {
   mkdirSync, appendFileSync, existsSync,
   statSync, renameSync, readdirSync, unlinkSync,
+  lstatSync, readFileSync, writeFileSync, chmodSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash, randomUUID } from 'node:crypto';
+import { ScopedAXBridge, SCOPED_AX_TOOLS, SCOPED_AX_OPERATIONS,
+  redactScopedAXAuditArgs } from './scoped-ax.mjs';
+import { scopedAXHelperPath, validateScopedAXHelper } from './scoped-ax-helper.mjs';
+
+import { withToolMetadata } from './tool-metadata.mjs';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -92,7 +100,300 @@ const DEFAULT_LOG_FILE = join(
 // The default remains the established user-visible location.
 const LOG_FILE = resolve(process.env.TINKY_AUDIT_PATH || DEFAULT_LOG_FILE);
 const LOG_DIR = dirname(LOG_FILE);
-const READ_ONLY = process.argv.includes('--read-only');
+const READ_ONLY = process.argv.includes('--read-only') || process.env.TINKY_READ_ONLY === 'true';
+const PORTAL_STREAM_DIR = resolve(process.env.TINKY_STREAM_DIR || join(
+  homedir(), '.kist', 'runs', 'desktop-vision-console', 'stream',
+));
+
+const PORTAL_FILES = Object.freeze({
+  handoff: 'portal-handoff.json',
+  state: 'portal-state.json',
+  composedRecord: 'composed-frame.json',
+  composed: 'composed-latest.jpg',
+  full: 'latest.jpg',
+});
+const PORTAL_CONTROL_DIR = join(PORTAL_STREAM_DIR, 'portal-control');
+const PORTAL_CONTROL_BINDING = join(PORTAL_CONTROL_DIR, 'binding.json');
+const PORTAL_CONTROL_TOKEN = join(PORTAL_CONTROL_DIR, '.session-token');
+const PORTAL_CONTROL_REQUESTS = join(PORTAL_CONTROL_DIR, 'requests');
+const PORTAL_CONTROL_RESPONSES = join(PORTAL_CONTROL_DIR, 'responses');
+const PORTAL_CONTROLLER_ID = randomUUID();
+// The native portal host republishes this binding every 75ms. A five-second
+// ceiling tolerates scheduling pressure while ensuring an old owner file can
+// never be mistaken for a currently reachable physical Mac.
+const PORTAL_CONTROL_MAX_AGE_MS = 5_000;
+
+function readBoundedRegularFile(path, maximumBytes) {
+  let info;
+  try { info = lstatSync(path); }
+  catch { throw new Error(`Portal vision file is unavailable: ${path}`); }
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error(`Portal vision path is not a regular file: ${path}`);
+  }
+  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+    throw new Error(`Portal vision file is not owned by this user: ${path}`);
+  }
+  if (info.size <= 0 || info.size > maximumBytes) {
+    throw new Error(`Portal vision file has invalid size ${info.size}: ${path}`);
+  }
+  return { data: readFileSync(path), info };
+}
+
+function readPortalJSON(name, maximumBytes = 1024 * 1024) {
+  const path = join(PORTAL_STREAM_DIR, name);
+  const { data, info } = readBoundedRegularFile(path, maximumBytes);
+  try { return { value: JSON.parse(data.toString('utf8')), path, info }; }
+  catch { throw new Error(`Portal vision JSON is malformed: ${path}`); }
+}
+
+function portalStateSnapshot() {
+  let handoff = null;
+  let handoffObservation = null;
+  const handoffPath = join(PORTAL_STREAM_DIR, PORTAL_FILES.handoff);
+  if (existsSync(handoffPath)) {
+    const handoffFile = readPortalJSON(PORTAL_FILES.handoff, 256 * 1024);
+    if (handoffFile.value?.schemaVersion !== 1) {
+      throw new Error(
+        `Unsupported portal-handoff schema: ${handoffFile.value?.schemaVersion ?? 'missing'}`,
+      );
+    }
+    handoff = handoffFile.value;
+    handoffObservation = {
+      path: handoffFile.path,
+      fileAgeMs: Math.max(0, Date.now() - handoffFile.info.mtimeMs),
+    };
+  }
+
+  let stateFile;
+  try {
+    stateFile = readPortalJSON(PORTAL_FILES.state);
+  } catch (error) {
+    if (!handoff) throw error;
+    return {
+      schemaVersion: 1,
+      session: null,
+      health: null,
+      focus: null,
+      input: null,
+      vision: null,
+      handoff,
+      observation: {
+        readAt: new Date().toISOString(),
+        statePath: join(PORTAL_STREAM_DIR, PORTAL_FILES.state),
+        stateUnavailable: error instanceof Error ? error.message : String(error),
+        handoff: handoffObservation,
+      },
+    };
+  }
+  const state = stateFile.value;
+  if (state?.schemaVersion !== 1) {
+    throw new Error(`Unsupported portal-state schema: ${state?.schemaVersion ?? 'missing'}`);
+  }
+  const now = Date.now();
+  const observedAt = Date.parse(state?.health?.observedAt || '');
+  const lastFrameAt = Date.parse(state?.health?.lastFrameAt || '');
+  const heartbeatAt = Date.parse(state?.vision?.heartbeatAt || '');
+  const { portalLatestPath: _nonexistentPortalPath, ...reportedVision } = state?.vision || {};
+  const availableLanes = [];
+  if (existsSync(join(PORTAL_STREAM_DIR, PORTAL_FILES.composedRecord)) &&
+      existsSync(join(PORTAL_STREAM_DIR, PORTAL_FILES.composed))) {
+    availableLanes.push('composed');
+  }
+  if (existsSync(join(PORTAL_STREAM_DIR, PORTAL_FILES.full))) {
+    availableLanes.push('full');
+  }
+  return {
+    ...state,
+    vision: state?.vision ? { ...reportedVision, availableLanes } : null,
+    handoff,
+    observation: {
+      readAt: new Date(now).toISOString(),
+      statePath: stateFile.path,
+      stateFileAgeMs: Math.max(0, now - stateFile.info.mtimeMs),
+      observedAgeMs: Number.isFinite(observedAt) ? Math.max(0, now - observedAt) : null,
+      frameAgeMs: Number.isFinite(lastFrameAt) ? Math.max(0, now - lastFrameAt) : null,
+      heartbeatAgeMs: Number.isFinite(heartbeatAt) ? Math.max(0, now - heartbeatAt) : null,
+      handoff: handoffObservation,
+    },
+  };
+}
+
+function readVerifiedPortalLane(lane) {
+  if (lane === 'full') {
+    const path = join(PORTAL_STREAM_DIR, PORTAL_FILES.full);
+    const { data, info } = readBoundedRegularFile(path, 64 * 1024 * 1024);
+    return {
+      data,
+      path,
+      sha256: createHash('sha256').update(data).digest('hex'),
+      bytes: data.length,
+      ageMs: Math.max(0, Date.now() - info.mtimeMs),
+      record: null,
+    };
+  }
+  let lastMismatch;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const recordFile = readPortalJSON(PORTAL_FILES.composedRecord);
+    const imagePath = join(PORTAL_STREAM_DIR, PORTAL_FILES.composed);
+    const { data, info } = readBoundedRegularFile(imagePath, 64 * 1024 * 1024);
+    const sha256 = createHash('sha256').update(data).digest('hex');
+    if (recordFile.value?.jpegSHA256 === sha256 &&
+        recordFile.value?.lane === lane &&
+        recordFile.value?.schemaVersion === 1) {
+      return {
+        data,
+        path: imagePath,
+        sha256,
+        bytes: data.length,
+        ageMs: Math.max(0, Date.now() - info.mtimeMs),
+        record: recordFile.value,
+      };
+    }
+    lastMismatch = `Portal ${lane} frame does not match its atomic metadata record.`;
+  }
+  throw new Error(lastMismatch);
+}
+
+function readOwnerOnlyFile(path, maximumBytes) {
+  const file = readBoundedRegularFile(path, maximumBytes);
+  if ((file.info.mode & 0o077) !== 0) {
+    throw new Error(`Portal control file is not owner-only: ${path}`);
+  }
+  return file;
+}
+
+function portalControlBinding() {
+  const { data, info } = readOwnerOnlyFile(PORTAL_CONTROL_BINDING, 256 * 1024);
+  let value;
+  try { value = JSON.parse(data.toString('utf8')); }
+  catch { throw new Error('Portal control binding is malformed.'); }
+  if (value?.schemaVersion !== 1 || value?.sourceKind !== 'remoteMac') {
+    throw new Error('The active portal is not a controllable remote Mac session.');
+  }
+  const now = Date.now();
+  const rawFileAgeMs = now - info.mtimeMs;
+  const declaredUpdatedAt = Number(value.updatedAtMilliseconds);
+  const declaredAgeMs = now - declaredUpdatedAt;
+  const hostPID = Number(value.hostProcessIdentifier);
+  let hostProcessLive = false;
+  if (Number.isSafeInteger(hostPID) && hostPID > 1) {
+    try {
+      process.kill(hostPID, 0);
+      hostProcessLive = true;
+    } catch (error) {
+      // EPERM still proves that a process occupies the advertised PID. The
+      // owner-private binding and tight freshness window remain mandatory.
+      hostProcessLive = error?.code === 'EPERM';
+    }
+  }
+  const fresh = rawFileAgeMs >= -1_000 &&
+    rawFileAgeMs <= PORTAL_CONTROL_MAX_AGE_MS &&
+    Number.isFinite(declaredUpdatedAt) &&
+    declaredAgeMs >= -1_000 &&
+    declaredAgeMs <= PORTAL_CONTROL_MAX_AGE_MS;
+  const transportReady = typeof value.transportSessionID === 'string' &&
+    value.transportSessionID.length > 0;
+  const available = fresh && hostProcessLive && transportReady;
+  const hostMessage = value.message;
+  return {
+    ...value,
+    hostMessage,
+    message: available
+      ? hostMessage
+      : 'Remote Mac control host is offline or stale; no control command can be sent.',
+    observation: {
+      readAt: new Date(now).toISOString(),
+      ageMs: Math.max(0, rawFileAgeMs),
+      declaredAgeMs: Number.isFinite(declaredAgeMs)
+        ? Math.max(0, declaredAgeMs)
+        : null,
+      fresh,
+      hostProcessLive,
+      transportReady,
+      available,
+      controllerMatches: value.controllerID === PORTAL_CONTROLLER_ID,
+    },
+  };
+}
+
+function requireAvailablePortalControl(binding) {
+  if (!binding?.observation?.available) {
+    throw new Error(
+      'The remote Mac control host is offline, stale, or lacks an authenticated transport session.',
+    );
+  }
+  return binding;
+}
+
+function requireActivePortalControl() {
+  const binding = requireAvailablePortalControl(portalControlBinding());
+  if (!binding.active || binding.controllerID !== PORTAL_CONTROLLER_ID) {
+    throw new Error(
+      'Perslis control is not granted to this MCP process. Call portal_remote_begin first.',
+    );
+  }
+  if (!binding.transportSessionID ||
+      Number(binding.grantedUntilMilliseconds || 0) < Date.now()) {
+    throw new Error('The Perslis control grant expired or has no live transport session.');
+  }
+  return binding;
+}
+
+function wait(milliseconds) {
+  return new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds));
+}
+
+async function sendPortalControlCommand(action, values = {}, timeoutMs = 30_000) {
+  const binding = requireAvailablePortalControl(portalControlBinding());
+  const token = readOwnerOnlyFile(PORTAL_CONTROL_TOKEN, 1024)
+    .data.toString('utf8').trim();
+  if (token.length < 64 || token.length > 256) {
+    throw new Error('Portal control session token is invalid.');
+  }
+  for (const directory of [PORTAL_CONTROL_REQUESTS, PORTAL_CONTROL_RESPONSES]) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+  }
+  const commandID = randomUUID();
+  const now = Date.now();
+  const command = {
+    schemaVersion: 1,
+    commandID,
+    controllerID: PORTAL_CONTROLLER_ID,
+    token,
+    sourceID: binding.sourceID,
+    transportSessionID: binding.transportSessionID,
+    issuedAtMilliseconds: now,
+    expiresAtMilliseconds: now + Math.min(60_000, Math.max(5_000, timeoutMs)),
+    action,
+    ...values,
+  };
+  const requestPath = join(PORTAL_CONTROL_REQUESTS, `${commandID}.json`);
+  const temporaryPath = join(PORTAL_CONTROL_REQUESTS, `.${commandID}.${process.pid}.tmp`);
+  const responsePath = join(PORTAL_CONTROL_RESPONSES, `${commandID}.json`);
+  writeFileSync(temporaryPath, JSON.stringify(command), { flag: 'wx', mode: 0o600 });
+  chmodSync(temporaryPath, 0o600);
+  renameSync(temporaryPath, requestPath);
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      if (existsSync(responsePath)) {
+        const { data } = readOwnerOnlyFile(responsePath, 1024 * 1024);
+        const response = JSON.parse(data.toString('utf8'));
+        unlinkSync(responsePath);
+        if (response.commandID !== commandID) {
+          throw new Error('Portal control response ID does not match its command.');
+        }
+        if (!response.ok) throw new Error(response.message || 'Remote action failed.');
+        return { ...response, binding: portalControlBinding() };
+      }
+      await wait(50);
+    }
+    throw new Error(`Portal control action ${action} timed out.`);
+  } finally {
+    try { if (existsSync(requestPath)) unlinkSync(requestPath); } catch { /* exact stale request */ }
+  }
+}
 
 // AUTO_APPROVE bypasses the osascript dialog. Used by `npm test` and by
 // power users who explicitly want non-interactive use. Documented as a
@@ -129,6 +430,18 @@ const DEFAULT_DENY = new Set([
 const EXTRA_DENY = (process.env.TINKY_DENY_BUNDLES || '')
   .split(':').map(s => s.trim()).filter(Boolean);
 const DENY_BUNDLES = new Set([...DEFAULT_DENY, ...EXTRA_DENY]);
+// Independent, lazy native lane. Its own visible consent cannot inherit the
+// legacy AUTO_APPROVE switch, and restart never revives an old window handle.
+let scopedAX = null;
+function scopedAXBridge() {
+  if (!scopedAX) {
+    const root = resolve(__dirname, '..');
+    const helper = scopedAXHelperPath(root);
+    scopedAX = new ScopedAXBridge({ helperPath: validateScopedAXHelper(root, helper), readOnly: READ_ONLY,
+      denyBundles: [...DENY_BUNDLES], beforeSpawn: () => validateScopedAXHelper(root, helper) });
+  }
+  return scopedAX;
+}
 
 // ─────────────────────── self-substrate protection ───────────────────────
 // HARD block (un-bypassable by consent): refuse a WRITE whose payload is a
@@ -190,6 +503,9 @@ mkdirSync(LOG_DIR, { recursive: true });
 const SECRET_ARG_KEYS = new Set(['text', 'password', 'token', 'secret', 'apiKey']);
 
 function redactArgsForAudit(toolName, args) {
+  if (Object.hasOwn(SCOPED_AX_OPERATIONS, toolName)) {
+    return redactScopedAXAuditArgs(SCOPED_AX_OPERATIONS[toolName], args);
+  }
   if (!args || typeof args !== 'object') return args;
   const out = {};
   for (const [k, v] of Object.entries(args)) {
@@ -422,6 +738,96 @@ function guardedWrite(toolName, target, description) {
 // ────────────────────────── tool defs ──────────────────────────
 
 const TOOLS = [
+  ...SCOPED_AX_TOOLS,
+  {
+    name: 'os_screenshot_image',
+    description: 'Capture the screen or one app window and return an MCP image directly to the connected AI client. The image may be sent to the client model provider. Requires Screen Recording permission.',
+    inputSchema: { type: 'object', additionalProperties: false,
+      properties: { bundleId: { type: 'string', description: 'Optional macOS application bundle identifier.' } } },
+  },
+  {
+    name: 'portal_state',
+    description:
+      'Read the GhostBridge handoff phase plus active right-portal session identity, source kind, lifecycle/health, frame freshness, focus owner, cursor/keyboard capture, pressed input state, and TinkyStream paths. Read-only. Use this before reasoning about or controlling the portal.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'portal_snapshot',
+    description:
+      'See the active GhostBridge workspace through its verified composed left+right frame or TinkyStream full physical frame. The composed image is SHA-256 matched to atomic metadata and returned with session health/freshness. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        lane: {
+          type: 'string',
+          enum: ['composed', 'full'],
+          description: 'composed = exact left+right compositor; full = TinkyStream physical capture. Defaults to composed.',
+        },
+      },
+    },
+  },
+  {
+    name: 'portal_remote_status',
+    description:
+      'Read the live Perslis-to-remote-Mac control binding: exact source, paired agent, authenticated transport session, grant owner/expiry, and whether this MCP process owns the active grant. Read-only.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'portal_remote_begin',
+    description:
+      'Ask the user for a visible, time-bounded grant allowing this MCP process to control the explicitly connected remote Mac in the GhostBridge right panel. The grant is bound to the paired agent and current authenticated transport session; reconnect revokes it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        durationSeconds: { type: 'integer', minimum: 30, maximum: 900, description: 'Grant duration; defaults to 600 seconds.' },
+        description: { type: 'string', description: 'Required plain-language explanation of what Perslis will do on the remote Mac.' },
+      },
+      required: ['description'],
+    },
+  },
+  {
+    name: 'portal_remote_control',
+    description:
+      'Control the explicitly connected remote Mac after portal_remote_begin. Coordinates are in the direct portal source frame returned by portal_snapshot, not full-screen coordinates. Supported actions: move, click, scroll, key, type.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['move', 'click', 'scroll', 'key', 'type'] },
+        x: { type: 'number', description: 'Remote source-frame X for move/click.' },
+        y: { type: 'number', description: 'Remote source-frame Y for move/click.' },
+        button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Click button; defaults to left.' },
+        deltaX: { type: 'number', description: 'Horizontal pixel scroll delta.' },
+        deltaY: { type: 'number', description: 'Vertical pixel scroll delta.' },
+        keyCode: { type: 'integer', minimum: 0, maximum: 255, description: 'macOS virtual key code.' },
+        text: { type: 'string', maxLength: 4096, description: 'Unicode text for the type action.' },
+        modifiers: { type: 'array', items: { type: 'string', enum: ['capsLock', 'command', 'control', 'function', 'option', 'shift'] } },
+        description: { type: 'string', description: 'Required plain-language summary for audit and user-visible intent.' },
+      },
+      required: ['action', 'description'],
+    },
+  },
+  {
+    name: 'portal_remote_files',
+    description:
+      'Move regular files through the authenticated remote-Mac session. send accepts absolute local paths and commits them into the remote owner-only transfer folder; receive accepts one safe filename from that folder and returns its verified local path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['send', 'receive'] },
+        paths: { type: 'array', minItems: 1, items: { type: 'string' }, description: 'Absolute local file paths for send.' },
+        name: { type: 'string', description: 'Safe single filename for receive.' },
+        contentType: { type: 'string', description: 'MIME type; defaults to application/octet-stream.' },
+        description: { type: 'string', description: 'Required plain-language transfer intent.' },
+      },
+      required: ['mode', 'description'],
+    },
+  },
+  {
+    name: 'portal_remote_release',
+    description:
+      'Immediately release all remote mouse buttons and keys, return focus ownership to the left workspace, and revoke this MCP process control grant. This safety action remains available in read-only mode.',
+    inputSchema: { type: 'object', properties: {} },
+  },
   {
     name: 'os_screenshot',
     description:
@@ -547,7 +953,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: 'tinky-vision-mcp',
-    version: '0.1.4',
+    version: '0.2.0',
   },
   {
     capabilities: { tools: {} },
@@ -555,7 +961,7 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
+  tools: TOOLS.map(withToolMetadata),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -564,6 +970,33 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     let result;
     switch (name) {
+      case 'os_ax_targets':
+      case 'os_ax_snapshot':
+      case 'os_ax_press':
+      case 'os_ax_release':
+        result = await scopedAXBridge().request(SCOPED_AX_OPERATIONS[name], args);
+        break;
+      case 'os_ax_enroll': {
+        const refusal = substrateContentRefusal(args?.purpose);
+        if (refusal) throw new Error(refusal);
+        result = await scopedAXBridge().request('enroll', args);
+        break;
+      }
+      case 'os_screenshot_image': {
+        const argv = [];
+        if (args.bundleId) argv.push('--app', args.bundleId);
+        const frame = callHelper('screenshot', argv);
+        if (!frame?.path || !frame.ok) throw new Error('Screenshot capture failed.');
+        const { data } = readBoundedRegularFile(frame.path, 16 * 1024 * 1024);
+        if (!data.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) {
+          throw new Error('Screenshot helper did not return a PNG.');
+        }
+        const auditReceipt = audit({ tool: name, args, ok: true, ms: Date.now() - startedAt });
+        return { content: [
+          { type: 'text', text: JSON.stringify({ ...frame, auditReceipt }) },
+          { type: 'image', data: data.toString('base64'), mimeType: 'image/png' },
+        ] };
+      }
       case 'os_screenshot': {
         const argv = [];
         if (args.bundleId) argv.push('--app', args.bundleId);
@@ -571,6 +1004,162 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         result = callHelper('screenshot', argv);
         break;
       }
+      case 'portal_state':
+        result = portalStateSnapshot();
+        break;
+      case 'portal_snapshot': {
+        const lane = args.lane || 'composed';
+        if (!['composed', 'full'].includes(lane)) {
+          throw new Error(`Invalid portal lane: ${lane}`);
+        }
+        const state = portalStateSnapshot();
+        const frame = readVerifiedPortalLane(lane);
+        const summary = {
+          ok: true,
+          lane,
+          imagePath: frame.path,
+          imageSHA256: frame.sha256,
+          imageBytes: frame.bytes,
+          imageAgeMs: frame.ageMs,
+          frameRecord: frame.record,
+          portal: state,
+        };
+        result = {
+          _mcpContent: [
+            { type: 'text', text: JSON.stringify(summary) },
+            { type: 'image', data: frame.data.toString('base64'), mimeType: 'image/jpeg' },
+          ],
+          _auditSummary: summary,
+        };
+        break;
+      }
+      case 'portal_remote_status':
+        result = portalControlBinding();
+        break;
+      case 'portal_remote_begin': {
+        const binding = requireAvailablePortalControl(portalControlBinding());
+        const description = String(args.description || '').trim();
+        if (!description) {
+          throw new Error('A plain-language remote-control description is required.');
+        }
+        const durationSeconds = args.durationSeconds ?? 600;
+        if (!Number.isInteger(durationSeconds) ||
+            durationSeconds < 30 || durationSeconds > 900) {
+          throw new Error('durationSeconds must be an integer from 30 through 900.');
+        }
+        const remoteTarget =
+          `GhostBridge remote Mac ${binding.displayName}` +
+          (binding.remoteAgentID ? ` (${binding.remoteAgentID})` : '');
+        guardedWrite(
+          'portal_remote_begin',
+          remoteTarget,
+          `Grant Perslis control for ${durationSeconds} seconds: ${description}`,
+        );
+        result = await sendPortalControlCommand('begin', { durationSeconds });
+        break;
+      }
+      case 'portal_remote_control': {
+        requireActivePortalControl();
+        const action = String(args.action || '');
+        const description = String(args.description || '').trim();
+        if (!description) throw new Error('A remote action description is required.');
+        const refusal = substrateContentRefusal(args.text, description);
+        if (refusal) throw new Error(refusal);
+
+        const values = {};
+        const finite = (value, label) => {
+          if (typeof value !== 'number' || !Number.isFinite(value)) {
+            throw new Error(`${label} must be a finite number.`);
+          }
+          return value;
+        };
+        if (args.modifiers != null) {
+          if (!Array.isArray(args.modifiers) ||
+              args.modifiers.some(value => ![
+                'capsLock', 'command', 'control', 'function', 'option', 'shift',
+              ].includes(value))) {
+            throw new Error('modifiers contains an unsupported value.');
+          }
+          values.modifiers = [...new Set(args.modifiers)];
+        }
+        switch (action) {
+          case 'move':
+            values.x = finite(args.x, 'x');
+            values.y = finite(args.y, 'y');
+            break;
+          case 'click':
+            values.x = finite(args.x, 'x');
+            values.y = finite(args.y, 'y');
+            values.button = args.button || 'left';
+            if (!['left', 'right', 'middle'].includes(values.button)) {
+              throw new Error('button must be left, right, or middle.');
+            }
+            break;
+          case 'scroll':
+            values.deltaX = finite(args.deltaX ?? 0, 'deltaX');
+            values.deltaY = finite(args.deltaY ?? 0, 'deltaY');
+            if (values.deltaX === 0 && values.deltaY === 0) {
+              throw new Error('scroll requires a non-zero deltaX or deltaY.');
+            }
+            break;
+          case 'key':
+            if (!Number.isInteger(args.keyCode) || args.keyCode < 0 || args.keyCode > 255) {
+              throw new Error('keyCode must be an integer from 0 through 255.');
+            }
+            values.keyCode = args.keyCode;
+            break;
+          case 'type':
+            if (typeof args.text !== 'string' || args.text.length === 0 || args.text.length > 4096) {
+              throw new Error('text must contain 1 through 4096 characters.');
+            }
+            values.text = args.text;
+            break;
+          default:
+            throw new Error(`Unsupported remote action: ${action || '<missing>'}.`);
+        }
+        result = await sendPortalControlCommand(action, values);
+        break;
+      }
+      case 'portal_remote_files': {
+        requireActivePortalControl();
+        const mode = String(args.mode || '');
+        const description = String(args.description || '').trim();
+        if (!description) throw new Error('A file-transfer description is required.');
+        if (mode === 'send') {
+          if (!Array.isArray(args.paths) || args.paths.length === 0 ||
+              args.paths.some(path => typeof path !== 'string' ||
+                !path.startsWith('/') || path.includes('\0'))) {
+            throw new Error('send requires one or more absolute local file paths.');
+          }
+          result = await sendPortalControlCommand(
+            'sendFiles',
+            { paths: args.paths },
+            120_000,
+          );
+        } else if (mode === 'receive') {
+          const name = args.name;
+          if (typeof name !== 'string' || name.length === 0 || name.length > 255 ||
+              name === '.' || name === '..' || name.includes('/') ||
+              name.includes('\\') || name.includes('\0')) {
+            throw new Error('receive requires one safe filename without path separators.');
+          }
+          const contentType = args.contentType || 'application/octet-stream';
+          if (typeof contentType !== 'string' || contentType.length > 255) {
+            throw new Error('contentType must be a short string.');
+          }
+          result = await sendPortalControlCommand(
+            'receiveFile',
+            { name, contentType },
+            120_000,
+          );
+        } else {
+          throw new Error('mode must be send or receive.');
+        }
+        break;
+      }
+      case 'portal_remote_release':
+        result = await sendPortalControlCommand('release', {}, 10_000);
+        break;
       case 'os_list_apps':
         result = callHelper('apps');
         break;
@@ -623,7 +1212,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-    const auditReceipt = audit({ tool: name, args, ok: true, ms: Date.now() - startedAt });
+    const scopedObservation = Object.hasOwn(SCOPED_AX_OPERATIONS, name)
+      ? { ok: result.disposition === 'observed', disposition: result.disposition,
+        code: result.code, accepted: false } : { ok: true };
+    const auditReceipt = audit({ tool: name, args, ...scopedObservation, ms: Date.now() - startedAt });
+    if (result?._mcpContent) {
+      const content = [...result._mcpContent];
+      const summary = { ...result._auditSummary, auditReceipt };
+      content[0] = { type: 'text', text: JSON.stringify(summary) };
+      return { content };
+    }
     if (result && typeof result === 'object' && !Array.isArray(result)) {
       result = { ...result, auditReceipt };
     }
@@ -642,6 +1240,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 // ────────────────────────── start ──────────────────────────
 
 const transport = new StdioServerTransport();
+server.onclose = () => { void scopedAX?.close(); };
+process.stdin.once('end', () => { void scopedAX?.close(); });
+for (const event of ['SIGINT', 'SIGTERM']) {
+  process.once(event, () => { void Promise.resolve(scopedAX?.close()).finally(() => process.exit(0)); });
+}
+process.once('exit', () => scopedAX?.closeNow());
 await server.connect(transport);
 console.error(
   `[tinky-vision-mcp] ready · helper=${HELPER_BIN} · log=${LOG_FILE}` +

@@ -34,6 +34,7 @@
 // tests yet, no exit-code matrix verified.
 
 import AppKit
+import ScopedAX
 import ApplicationServices
 import CoreGraphics
 import Vision
@@ -783,18 +784,363 @@ func cmdAXCheck(_ args: Args) {
 // writes DIR/latest.jpg atomically (tmp + rename) at up to N fps, plus an
 // optional bounded ring of numbered frames (frame-0000.jpg … frame-(ring-1).jpg,
 // slots reused cyclically — history is capped by construction, never pruned by
-// a separate job). Runs until SIGTERM/SIGINT; heartbeats JSON to stdout every
-// 5s so a supervisor can verify liveness. Requires Screen Recording permission
-// on the responsible process (same TCC grant `screenshot` already relies on).
+// a separate job). When --archive-dir is set, the full stream is also sealed
+// into timestamped five-minute MP4 segments before the live ring cycles onward.
+// Runs until SIGTERM/SIGINT; heartbeats JSON to stdout every 5s so a supervisor
+// can verify liveness. Requires Screen Recording permission on the responsible
+// process (same TCC grant `screenshot` already relies on).
 
 import ScreenCaptureKit
 import CoreImage
 import CoreMedia
+import AVFoundation
+
+// Persistent history is deliberately separate from the bounded JPEG recycler:
+// the ring stays at 300 slots for low-latency inspection, while AVAssetWriter
+// receives the same pixel buffers and closes one independently playable MP4 per
+// time block. Existing archives are never rotated or deleted. If the configured
+// free-space reserve is reached, only archival pauses; latest.jpg and the live
+// ring continue normally.
+final class StreamArchiveWriter {
+    private let root: URL
+    private let streamName: String
+    private let fps: Int
+    private let segmentSeconds: Int
+    private let segmentFrames: Int
+    private let minimumFreeBytes: Int64
+    private let bitrateKbps: Int
+
+    // Active writer state is touched only by StreamSink's serial sample queue.
+    private var writer: AVAssetWriter?
+    private var input: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var partialURL: URL?
+    private var finalURL: URL?
+    private var manifestURL: URL?
+    private var segmentStartedAt: Date?
+    private var segmentFirstSourceFrame: Int = 0
+    private var segmentLastSourceFrame: Int = 0
+    private var framesInSegment: Int = 0
+    private var sourceFramesSeen: Int = 0
+
+    // Completion callbacks and heartbeat reads can happen off the sample queue.
+    private let statsLock = NSLock()
+    private var completedSegments: Int = 0
+    private var failedSegments: Int = 0
+    private var backpressureDrops: Int = 0
+    private var lowSpaceSkippedFrames: Int = 0
+    private var finishingSegments: Int = 0
+    private var pausedForLowSpace: Bool = false
+    private var lastCompletedPath: String?
+    private var lastError: String?
+
+    init(root: URL, streamName: String, fps: Int, segmentSeconds: Int,
+         minimumFreeBytes: Int64, bitrateKbps: Int) {
+        self.root = root
+        self.streamName = streamName
+        self.fps = fps
+        self.segmentSeconds = segmentSeconds
+        self.segmentFrames = max(1, fps * segmentSeconds)
+        self.minimumFreeBytes = minimumFreeBytes
+        self.bitrateKbps = bitrateKbps
+    }
+
+    private func makeDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+
+    private func availableCapacity() -> Int64? {
+        guard let values = try? root.resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeAvailableCapacityKey,
+        ]) else { return nil }
+        if let basic = values.volumeAvailableCapacity {
+            return Int64(basic)
+        }
+        // Important-usage capacity may include purgeable bytes. Use it only as
+        // a fallback so the configured reserve reflects genuinely free space.
+        if let important = values.volumeAvailableCapacityForImportantUsage {
+            return important
+        }
+        return nil
+    }
+
+    private func stamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        return formatter.string(from: date)
+    }
+
+    private func dayStamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    private func recordError(_ message: String, failedSegment: Bool = false) {
+        statsLock.lock()
+        lastError = message
+        if failedSegment { failedSegments += 1 }
+        statsLock.unlock()
+    }
+
+    private func beginSegment(width: Int, height: Int) -> Bool {
+        do {
+            try makeDirectory(root)
+        } catch {
+            recordError("cannot create archive folder: \(error.localizedDescription)",
+                        failedSegment: true)
+            return false
+        }
+
+        guard let freeBytes = availableCapacity() else {
+            recordError("cannot determine free disk space; archival paused")
+            return false
+        }
+        guard freeBytes >= minimumFreeBytes else {
+            statsLock.lock()
+            pausedForLowSpace = true
+            lowSpaceSkippedFrames += 1
+            lastError = "archive paused below free-space reserve"
+            statsLock.unlock()
+            return false
+        }
+        guard width.isMultiple(of: 2), height.isMultiple(of: 2) else {
+            recordError("archive requires even video dimensions (got \(width)x\(height))",
+                        failedSegment: true)
+            return false
+        }
+
+        do {
+            let started = Date()
+            let nominalEnd = started.addingTimeInterval(TimeInterval(segmentSeconds))
+            let day = root.appendingPathComponent(dayStamp(started), isDirectory: true)
+            try makeDirectory(day)
+            let token = String(UUID().uuidString.prefix(8)).lowercased()
+            let base = "\(stamp(started))_to_\(stamp(nominalEnd))_\(streamName)_\(token)"
+            let partial = day.appendingPathComponent(".\(base).inprogress.mp4")
+            let final = day.appendingPathComponent("\(base).mp4")
+            let manifest = day.appendingPathComponent("\(base).json")
+
+            let candidate = try AVAssetWriter(outputURL: partial, fileType: .mp4)
+            let compression: [String: Any] = [
+                AVVideoAverageBitRateKey: bitrateKbps * 1_000,
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoMaxKeyFrameIntervalKey: max(1, fps * 10),
+                AVVideoAllowFrameReorderingKey: false,
+            ]
+            let color: [String: Any] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ]
+            let settings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: compression,
+                AVVideoColorPropertiesKey: color,
+            ]
+            let candidateInput = AVAssetWriterInput(mediaType: .video,
+                                                     outputSettings: settings)
+            candidateInput.expectsMediaDataInRealTime = true
+            guard candidate.canAdd(candidateInput) else {
+                recordError("H.264 archive input is unsupported", failedSegment: true)
+                return false
+            }
+            candidate.add(candidateInput)
+            let sourceAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ]
+            let candidateAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: candidateInput,
+                sourcePixelBufferAttributes: sourceAttributes)
+            guard candidate.startWriting() else {
+                recordError("cannot start MP4 archive: " +
+                            (candidate.error?.localizedDescription ?? "unknown writer error"),
+                            failedSegment: true)
+                return false
+            }
+            candidate.startSession(atSourceTime: .zero)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: partial.path)
+
+            writer = candidate
+            input = candidateInput
+            adaptor = candidateAdaptor
+            partialURL = partial
+            finalURL = final
+            manifestURL = manifest
+            segmentStartedAt = started
+            segmentFirstSourceFrame = sourceFramesSeen
+            segmentLastSourceFrame = sourceFramesSeen
+            framesInSegment = 0
+            statsLock.lock()
+            pausedForLowSpace = false
+            lastError = nil
+            statsLock.unlock()
+            return true
+        } catch {
+            recordError("cannot initialize MP4 archive: \(error.localizedDescription)",
+                        failedSegment: true)
+            return false
+        }
+    }
+
+    func append(_ pixelBuffer: CVPixelBuffer) {
+        sourceFramesSeen += 1
+        if writer == nil {
+            guard beginSegment(width: CVPixelBufferGetWidth(pixelBuffer),
+                               height: CVPixelBufferGetHeight(pixelBuffer)) else { return }
+        }
+        guard let writer, let input, let adaptor else { return }
+        guard input.isReadyForMoreMediaData else {
+            statsLock.lock()
+            backpressureDrops += 1
+            statsLock.unlock()
+            return
+        }
+        let presentationTime = CMTime(value: CMTimeValue(framesInSegment),
+                                      timescale: CMTimeScale(fps))
+        guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
+            recordError("cannot append archive frame: " +
+                        (writer.error?.localizedDescription ?? "unknown writer error"))
+            if writer.status == .failed {
+                input.markAsFinished()
+                self.writer = nil
+                self.input = nil
+                self.adaptor = nil
+                framesInSegment = 0
+                recordError("MP4 segment failed; partial file retained", failedSegment: true)
+            }
+            return
+        }
+        framesInSegment += 1
+        segmentLastSourceFrame = sourceFramesSeen
+        if framesInSegment >= segmentFrames {
+            finishSegment()
+        }
+    }
+
+    private func finishSegment() {
+        guard let writer, let input,
+              let partialURL, let finalURL, let manifestURL,
+              let startedAt = segmentStartedAt else { return }
+        let frameCount = framesInSegment
+        let firstSourceFrame = segmentFirstSourceFrame
+        let lastSourceFrame = segmentLastSourceFrame
+        let duration = CMTime(value: CMTimeValue(frameCount),
+                              timescale: CMTimeScale(fps))
+        writer.endSession(atSourceTime: duration)
+        input.markAsFinished()
+
+        self.writer = nil
+        self.input = nil
+        self.adaptor = nil
+        self.partialURL = nil
+        self.finalURL = nil
+        self.manifestURL = nil
+        self.segmentStartedAt = nil
+        self.framesInSegment = 0
+        statsLock.lock()
+        finishingSegments += 1
+        statsLock.unlock()
+
+        writer.finishWriting { [self] in
+            statsLock.lock()
+            finishingSegments -= 1
+            statsLock.unlock()
+            guard writer.status == .completed else {
+                recordError("MP4 finalization failed; partial file retained: " +
+                            (writer.error?.localizedDescription ?? "unknown writer error"),
+                            failedSegment: true)
+                return
+            }
+            do {
+                try FileManager.default.moveItem(at: partialURL, to: finalURL)
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600], ofItemAtPath: finalURL.path)
+            } catch {
+                recordError("cannot publish completed MP4: \(error.localizedDescription)",
+                            failedSegment: true)
+                return
+            }
+
+            let endedAt = Date()
+            let iso = ISO8601DateFormatter()
+            let manifest: [String: Any] = [
+                "schemaVersion": 1,
+                "kind": "tinkystream-five-minute-archive",
+                "stream": streamName,
+                "videoFile": finalURL.lastPathComponent,
+                "startedAt": iso.string(from: startedAt),
+                "finalizedAt": iso.string(from: endedAt),
+                "nominalDurationSeconds": segmentSeconds,
+                "fps": fps,
+                "frameCount": frameCount,
+                "sourceFrameFirst": firstSourceFrame,
+                "sourceFrameLast": lastSourceFrame,
+                "codec": "h264",
+                "container": "mp4",
+                "bitrateKbps": bitrateKbps,
+            ]
+            do {
+                let data = try JSONSerialization.data(
+                    withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+                try data.write(to: manifestURL, options: .atomic)
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600], ofItemAtPath: manifestURL.path)
+            } catch {
+                recordError("MP4 saved but manifest failed: \(error.localizedDescription)")
+            }
+            statsLock.lock()
+            completedSegments += 1
+            lastCompletedPath = finalURL.path
+            statsLock.unlock()
+        }
+    }
+
+    func status() -> [String: Any] {
+        statsLock.lock()
+        let result: [String: Any] = [
+            "enabled": true,
+            "directory": root.path,
+            "segmentSeconds": segmentSeconds,
+            "segmentFrames": segmentFrames,
+            "minimumFreeBytes": minimumFreeBytes,
+            "bitrateKbps": bitrateKbps,
+            "activeFrames": framesInSegment,
+            "finishingSegments": finishingSegments,
+            "completedSegments": completedSegments,
+            "failedSegments": failedSegments,
+            "backpressureDrops": backpressureDrops,
+            "lowSpaceSkippedFrames": lowSpaceSkippedFrames,
+            "pausedForLowSpace": pausedForLowSpace,
+            "lastCompletedPath": lastCompletedPath ?? NSNull(),
+            "lastError": lastError ?? NSNull(),
+        ]
+        statsLock.unlock()
+        return result
+    }
+}
 
 final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
     private let dir: URL
     private let ring: Int
     private let quality: CGFloat
+    private let archive: StreamArchiveWriter?
     // Output basename (e.g. "latest.jpg" for the full mirror, "seethrough-latest.jpg"
     // for the Chrome-excluded see-through mirror). Lets one process run two streams
     // to two distinct frame files without clobbering each other.
@@ -802,19 +1148,77 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
     private let tmpName: String
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
-    // Written on the sample queue, read from the heartbeat loop. Int reads of a
-    // monotonically-increasing counter are tolerable here; a lock would be
-    // overkill for a diagnostic heartbeat.
-    private(set) var frames: Int = 0
-    private(set) var writeFailures: Int = 0
+    // ScreenCaptureKit invokes output and stop callbacks on different queues,
+    // while heartbeats and the recovery watchdog read this state concurrently.
+    // Keep the counters and retry generations behind one small lock instead of
+    // relying on unsynchronised Int reads.
+    private let stateLock = NSLock()
+    private var frameCount = 0
+    private var failureCount = 0
+    private var stopGeneration = 0
+    private var recoveredThroughStopGeneration = 0
+    private var attemptStartedUptime = ProcessInfo.processInfo.systemUptime
+    private var framesAtAttemptStart = 0
+    private var lastStopUptime: TimeInterval?
 
-    init(dir: URL, ring: Int, quality: CGFloat, latestName: String = "latest.jpg") {
+    var frames: Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return frameCount
+    }
+
+    var writeFailures: Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return failureCount
+    }
+
+    init(dir: URL, ring: Int, quality: CGFloat, latestName: String = "latest.jpg",
+         archive: StreamArchiveWriter? = nil) {
         self.dir = dir
         self.ring = ring
         self.quality = quality
         self.latestName = latestName
+        self.archive = archive
         // Distinct tmp per output so the two streams' atomic writes never race.
         self.tmpName = ".\(latestName).tmp"
+    }
+
+    // Called before every SCShareableContent request. The returned generation
+    // binds this exact attempt to any delegate stop it is recovering from.
+    func captureAttemptBegan() -> Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        attemptStartedUptime = ProcessInfo.processInfo.systemUptime
+        framesAtAttemptStart = frameCount
+        return stopGeneration
+    }
+
+    func captureStarted(recovering generation: Int) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        recoveredThroughStopGeneration = max(recoveredThroughStopGeneration, generation)
+    }
+
+    func currentStopGeneration() -> Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return stopGeneration
+    }
+
+    // A newly started stream must deliver at least one frame, and a delegate
+    // stop must be followed by a successfully started replacement. If either
+    // condition remains unresolved, the process-level watchdog lets launchd
+    // provide a clean ScreenCaptureKit process after the OS has wedged an async
+    // content request. Static screens are safe: once an attempt has delivered
+    // its first frame, no ongoing frame-rate assumption is made.
+    func recoveryReason(nowUptime: TimeInterval, timeout: TimeInterval) -> String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if let stoppedAt = lastStopUptime,
+           stopGeneration > recoveredThroughStopGeneration,
+           nowUptime - stoppedAt >= timeout {
+            return "delegate stop generation \(stopGeneration) was not recovered"
+        }
+        if frameCount == framesAtAttemptStart,
+           nowUptime - attemptStartedUptime >= timeout {
+            return "capture attempt produced no first frame"
+        }
+        return nil
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -822,12 +1226,13 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
         guard type == .screen,
               sampleBuffer.isValid,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        archive?.append(pixelBuffer)
         let image = CIImage(cvPixelBuffer: pixelBuffer)
         let qualityKey = CIImageRepresentationOption(
             rawValue: kCGImageDestinationLossyCompressionQuality as String)
         guard let jpeg = ciContext.jpegRepresentation(
             of: image, colorSpace: colorSpace, options: [qualityKey: quality]) else {
-            writeFailures += 1
+            stateLock.lock(); failureCount += 1; stateLock.unlock()
             return
         }
         let tmp = dir.appendingPathComponent(tmpName)
@@ -835,23 +1240,76 @@ final class StreamSink: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try jpeg.write(to: tmp)
             _ = try FileManager.default.replaceItemAt(latest, withItemAt: tmp)
+            stateLock.lock()
+            let ringIndex = frameCount
+            stateLock.unlock()
             if ring > 0 {
                 try? jpeg.write(to: dir.appendingPathComponent(
-                    String(format: "frame-%04d.jpg", frames % ring)))
+                    String(format: "frame-%04d.jpg", ringIndex % ring)))
             }
-            frames += 1
+            stateLock.lock(); frameCount += 1; stateLock.unlock()
         } catch {
-            writeFailures += 1
+            stateLock.lock(); failureCount += 1; stateLock.unlock()
         }
     }
 
+    func archiveStatus() -> [String: Any] {
+        archive?.status() ?? ["enabled": false]
+    }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        stateLock.lock()
+        stopGeneration += 1
+        lastStopUptime = ProcessInfo.processInfo.systemUptime
+        let generation = stopGeneration
+        stateLock.unlock()
         let payload = ["ok": false, "error": "stream stopped: \(error.localizedDescription)"] as [String: Any]
         if let data = try? JSONSerialization.data(withJSONObject: payload),
            let s = String(data: data, encoding: .utf8) {
             FileHandle.standardError.write(Data((s + "\n").utf8))
         }
-        exit(4)
+        // Do not exit directly from ScreenCaptureKit's delegate queue. An
+        // immediate launchd relaunch can race the OS teardown and leave the new
+        // process suspended forever inside SCShareableContent. runStream sees
+        // this generation and retries after a short teardown delay; the
+        // process watchdog remains the bounded fallback if that retry wedges.
+        jsonOut(["ok": false, "recovering": true,
+                 "stopGeneration": generation])
+        fflush(stdout)
+    }
+}
+
+func streamSessionIsLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+        return false
+    }
+    return (session["CGSSessionScreenIsLocked"] as? Bool) == true
+}
+
+func startStreamRecoveryWatchdog(_ sinks: [(label: String, sink: StreamSink)],
+                                 timeoutSeconds: TimeInterval = 45.0) {
+    Task {
+        while true {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if streamSessionIsLocked() { continue }
+            let now = ProcessInfo.processInfo.systemUptime
+            for entry in sinks {
+                guard let reason = entry.sink.recoveryReason(
+                    nowUptime: now, timeout: timeoutSeconds) else { continue }
+                let payload: [String: Any] = [
+                    "ok": false,
+                    "fatalRecoveryRestart": true,
+                    "stream": entry.label,
+                    "error": reason,
+                    "timeoutSeconds": timeoutSeconds,
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                   let line = String(data: data, encoding: .utf8) {
+                    FileHandle.standardError.write(Data((line + "\n").utf8))
+                }
+                exit(4)
+            }
+        }
     }
 }
 
@@ -879,28 +1337,70 @@ func makeFilter(display: SCDisplay, content: SCShareableContent,
     return SCContentFilter(display: display, excludingApplications: apps, exceptingWindows: [])
 }
 
+// ScreenCaptureKit's `displays.first` follows the current main display. That is
+// unsafe for GhostBridge: entering split mode deliberately makes the synthetic
+// 960x1080 "GhostBridge Half" workspace main, while the actual 1920x1080 DELL
+// panel contains the composed Mac + Windows view. Resolve the owner-configured
+// physical display by its stable NSScreen name and fail closed if it is absent;
+// never silently fall back to whichever synthetic display happens to be first.
+func screenName(for display: SCDisplay) -> String? {
+    NSScreen.screens.first { screen in
+        guard let number = screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber else { return false }
+        return CGDirectDisplayID(number.uint32Value) == display.displayID
+    }?.localizedName
+}
+
+func selectStreamDisplay(_ displays: [SCDisplay], named requestedName: String) -> SCDisplay? {
+    let wanted = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !wanted.isEmpty else { return nil }
+    return displays.first { display in
+        guard let candidate = screenName(for: display) else { return false }
+        return candidate.compare(wanted, options: [.caseInsensitive, .diacriticInsensitive])
+            == .orderedSame
+    }
+}
+
+func availableStreamDisplayNames(_ displays: [SCDisplay]) -> String {
+    displays.map { display in
+        let name = screenName(for: display) ?? "unnamed"
+        return "\(name)[id=\(display.displayID),\(display.width)x\(display.height)]"
+    }.joined(separator: ",")
+}
+
 // One retry-alive capture loop writing to `sink`. Optionally excludes apps
 // (see-through). When excluding, the filter is refreshed on each heartbeat so
 // target apps launching/quitting after start are still handled.
 func runStream(sink: StreamSink, label: String, outDir: String,
                fps: Int, scale: Double, ring: Int,
+               displayName: String,
                excludeBundleIDs: Set<String>,
-               hold: @escaping (SCStream) -> Void) async {
+               hold: @escaping (SCStream) -> Void,
+               release: @escaping (SCStream) -> Void) async {
     var attempt = 0
     while true {
         attempt += 1
+        let recoveringGeneration = sink.captureAttemptBegan()
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
                 false, onScreenWindowsOnly: false)
-            guard let display = content.displays.first else {
+            guard let display = selectStreamDisplay(content.displays,
+                                                    named: displayName) else {
                 throw NSError(domain: "tinky.stream", code: 3, userInfo: [
-                    NSLocalizedDescriptionKey: "no capturable display yet"])
+                    NSLocalizedDescriptionKey:
+                        "physical display \(displayName) unavailable; available=" +
+                        availableStreamDisplayNames(content.displays)])
             }
             let config = SCStreamConfiguration()
-            config.width = max(64, Int(Double(display.width) * scale))
-            config.height = max(64, Int(Double(display.height) * scale))
+            config.width = max(64, Int(Double(display.width) * scale)) / 2 * 2
+            config.height = max(64, Int(Double(display.height) * scale)) / 2 * 2
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
             config.pixelFormat = kCVPixelFormatType_32BGRA
+            // Normalize both full and see-through capture buffers before JPEG
+            // encoding. This avoids inheriting a transient display ICC profile
+            // from either the physical panel or GhostBridge's virtual display.
+            config.colorSpaceName = CGColorSpace.sRGB
             config.queueDepth = 5
             config.showsCursor = true
             let filter = makeFilter(display: display, content: content,
@@ -911,23 +1411,46 @@ func runStream(sink: StreamSink, label: String, outDir: String,
                 sampleHandlerQueue: DispatchQueue(label: "tinky.stream.sample.\(label)"))
             try await stream.startCapture()
             hold(stream) // lifetime anchor held by caller
+            sink.captureStarted(recovering: recoveringGeneration)
             jsonOut(["ok": true, "streaming": true, "stream": label, "dir": outDir,
                      "fps": fps, "scale": scale, "ring": ring,
                      "excludes": Array(excludeBundleIDs).sorted(),
+                     "displayID": display.displayID,
+                     "displayName": screenName(for: display) ?? displayName,
+                     "colorSpace": "sRGB",
+                     "archive": sink.archiveStatus(),
                      "width": config.width, "height": config.height,
                      "grantedAfterAttempts": attempt])
             fflush(stdout)
+            var nextHeartbeatUptime = ProcessInfo.processInfo.systemUptime + 5.0
             while true {
-                try await Task.sleep(nanoseconds: 5_000_000_000)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                if sink.currentStopGeneration() > recoveringGeneration {
+                    jsonOut(["ok": false, "recovering": true, "stream": label,
+                             "attempt": attempt,
+                             "stopGeneration": sink.currentStopGeneration()])
+                    fflush(stdout)
+                    try? await stream.stopCapture()
+                    release(stream)
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    break
+                }
+                // Heartbeats stay at their established five-second cadence
+                // even though stop recovery is polled once per second.
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                if nowUptime < nextHeartbeatUptime { continue }
+                nextHeartbeatUptime = nowUptime + 5.0
                 jsonOut(["ok": true, "heartbeat": true, "stream": label,
-                         "frames": sink.frames, "writeFailures": sink.writeFailures])
+                         "frames": sink.frames, "writeFailures": sink.writeFailures,
+                         "archive": sink.archiveStatus()])
                 fflush(stdout)
                 // Refresh the exclusion filter so Chrome windows opened after the
                 // stream started are still excluded (and quit ones stop being).
                 if !excludeBundleIDs.isEmpty,
                    let fresh = try? await SCShareableContent.excludingDesktopWindows(
                        false, onScreenWindowsOnly: false),
-                   let disp = fresh.displays.first {
+                   let disp = selectStreamDisplay(fresh.displays,
+                                                  named: displayName) {
                     let refreshed = makeFilter(display: disp, content: fresh,
                                                excludeBundleIDs: excludeBundleIDs)
                     try? await stream.updateContentFilter(refreshed)
@@ -949,10 +1472,29 @@ func cmdStream(_ args: Args) {
     guard let outDir = args.opts["out"] else {
         jsonErr("stream requires --out <dir>")
     }
-    let fps = max(1, min(60, Int(args.opts["fps"] ?? "15") ?? 15))
+    let fps = max(1, min(60, Int(args.opts["fps"] ?? "1") ?? 1))
     let scale = min(1.0, max(0.1, Double(args.opts["scale"] ?? "0.5") ?? 0.5))
     let quality = min(1.0, max(0.1, Double(args.opts["quality"] ?? "0.6") ?? 0.6))
     let ring = max(0, Int(args.opts["ring"] ?? "0") ?? 0)
+    let archiveSegmentSeconds = max(
+        1, min(86_400, Int(args.opts["archive-segment-seconds"] ?? "300") ?? 300))
+    let archiveMinimumFreeGB = max(
+        1.0, Double(args.opts["archive-min-free-gb"] ?? "15") ?? 15.0)
+    let archiveBitrateKbps = max(
+        100, min(20_000, Int(args.opts["archive-bitrate-kbps"] ?? "500") ?? 500))
+    let archiveRoot: URL? = args.opts["archive-dir"].flatMap { raw in
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath,
+                   isDirectory: true)
+    }
+    guard let rawDisplayName = args.opts["display-name"] else {
+        jsonErr("stream requires --display-name <physical display name>")
+    }
+    let displayName = rawDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !displayName.isEmpty else {
+        jsonErr("stream --display-name must not be empty")
+    }
     // See-through: apps to make invisible in a SECOND frame (seethrough-latest.jpg).
     // Comma-separated bundle IDs; empty disables the second stream. The primary
     // latest.jpg is ALWAYS the full frame so Chrome vision/task paths keep working.
@@ -962,7 +1504,7 @@ func cmdStream(_ args: Args) {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty })
     // A slower see-through fps keeps two concurrent captures light on the GPU.
-    let seethroughFps = max(1, min(fps, Int(args.opts["seethrough-fps"] ?? "8") ?? 8))
+    let seethroughFps = max(1, min(fps, Int(args.opts["seethrough-fps"] ?? "1") ?? 1))
     let dir = URL(fileURLWithPath: outDir, isDirectory: true)
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -976,21 +1518,38 @@ func cmdStream(_ args: Args) {
     let hold: (SCStream) -> Void = { s in
         retainLock.lock(); retained.append(s); retainLock.unlock()
     }
+    let release: (SCStream) -> Void = { s in
+        retainLock.lock(); retained.removeAll { $0 === s }; retainLock.unlock()
+    }
 
-    let primary = StreamSink(dir: dir, ring: ring, quality: CGFloat(quality))
+    let minimumFreeBytes = Int64(archiveMinimumFreeGB * 1_073_741_824.0)
+    let archive = archiveRoot.map {
+        StreamArchiveWriter(root: $0, streamName: "full", fps: fps,
+                            segmentSeconds: archiveSegmentSeconds,
+                            minimumFreeBytes: minimumFreeBytes,
+                            bitrateKbps: archiveBitrateKbps)
+    }
+    let primary = StreamSink(dir: dir, ring: ring, quality: CGFloat(quality),
+                             archive: archive)
+    var recoverySinks: [(label: String, sink: StreamSink)] = [("full", primary)]
     Task {
         await runStream(sink: primary, label: "full", outDir: outDir, fps: fps,
-                        scale: scale, ring: ring, excludeBundleIDs: [], hold: hold)
+                        scale: scale, ring: ring, displayName: displayName,
+                        excludeBundleIDs: [], hold: hold, release: release)
     }
     if !excludeBundleIDs.isEmpty {
         let seethrough = StreamSink(dir: dir, ring: 0, quality: CGFloat(quality),
                                     latestName: "seethrough-latest.jpg")
+        recoverySinks.append(("seethrough", seethrough))
         Task {
             await runStream(sink: seethrough, label: "seethrough", outDir: outDir,
                             fps: seethroughFps, scale: scale, ring: 0,
-                            excludeBundleIDs: excludeBundleIDs, hold: hold)
+                            displayName: displayName,
+                            excludeBundleIDs: excludeBundleIDs,
+                            hold: hold, release: release)
         }
     }
+    startStreamRecoveryWatchdog(recoverySinks)
     dispatchMain()
 }
 
@@ -1082,6 +1641,17 @@ func bundleStreamArgsIfLaunchedAsApp() -> Args? {
     if let v = env["TINKY_STREAM_SCALE"] { opts["scale"] = v }
     if let v = env["TINKY_STREAM_QUALITY"] { opts["quality"] = v }
     if let v = env["TINKY_STREAM_RING"] { opts["ring"] = v }
+    if let v = env["TINKY_STREAM_DISPLAY_NAME"] { opts["display-name"] = v }
+    if let v = env["TINKY_STREAM_ARCHIVE_DIR"] { opts["archive-dir"] = v }
+    if let v = env["TINKY_STREAM_ARCHIVE_SEGMENT_SECONDS"] {
+        opts["archive-segment-seconds"] = v
+    }
+    if let v = env["TINKY_STREAM_ARCHIVE_MIN_FREE_GB"] {
+        opts["archive-min-free-gb"] = v
+    }
+    if let v = env["TINKY_STREAM_ARCHIVE_BITRATE_KBPS"] {
+        opts["archive-bitrate-kbps"] = v
+    }
     // See-through mirror on by default: exclude Chrome from a second frame
     // (seethrough-latest.jpg). Override with TINKY_STREAM_EXCLUDE_APPS (set to
     // "" to disable, or a comma-separated bundle-ID list to change targets).
@@ -1102,6 +1672,8 @@ case "focused-window": cmdFocusedWindow(args)
 case "find-text":      cmdFindText(args)
 case "ax-tree":        cmdAXTree(args)
 case "ax-check":       cmdAXCheck(args)
+case "scoped-ax":
+    MainActor.assumeIsolated { ScopedAXRuntime.run(arguments: Array(CommandLine.arguments.dropFirst(2))) }
 case "stream":         cmdStream(args)
 case "approvals-refresh": cmdApprovalsRefresh(args)
 case "help", "--help", "-h":
@@ -1119,8 +1691,14 @@ case "help", "--help", "-h":
       find-text [--query "<substring>"] [--in <png>]
       ax-tree [--all] [--app <bundleID>] [--pid <int>] [--max <int>] [--depth <int>]
       ax-check
-      stream --out <dir> [--fps <1-60>] [--scale <0.1-1>] [--quality <0.1-1>] [--ring <n>]
+      scoped-ax --session-id <uuid> [--read-only] [--deny-bundle <bundleID>]
+      stream --out <dir> --display-name <physical display name>
+             [--fps <1-60>] [--scale <0.1-1>] [--quality <0.1-1>] [--ring <n>]
+             [--archive-dir <dir>] [--archive-segment-seconds <n>]
+             [--archive-min-free-gb <n>] [--archive-bitrate-kbps <n>]
              [--exclude-app <bundleID,…>] [--seethrough-fps <1-60>]
+             # --archive-dir saves timestamped H.264 MP4 segments without pruning;
+             # archival pauses at the free-space reserve while the live ring continues.
              # --exclude-app writes a second see-through frame (seethrough-latest.jpg)
              # with those apps excluded from the composite — invisible in the mirror,
              # untouched on the real screen. latest.jpg stays the full frame.

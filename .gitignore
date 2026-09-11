@@ -1,4 +1,9 @@
 node_modules/
+.release-work/
+dist/
+bundles/
+bin/tinky-os-scoped-ax
+bin/tinky-os-scoped-ax.manifest.json
 swift-helper/.build/
 swift-helper/.swiftpm/
 bin/tinky-os

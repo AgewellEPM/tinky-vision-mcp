@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "Please cite this software when using or demonstrating TinkyVision + IsolatedTester."
+title: "TinkyVision + IsolatedTester: screen understanding and isolated app testing over MCP"
+type: software
+authors:
+  - family-names: Kist
+    given-names: Luke
+    affiliation: TinkyBink
+repository-code: "https://github.com/AgewellEPM/tinky-vision-mcp"
+url: "https://github.com/AgewellEPM/tinky-vision-mcp"
+version: 0.2.0
+date-released: 2026-09-11
+license: MIT
+keywords:
+  - MCP
+  - accessibility
+  - OCR
+  - isolated testing
+  - text-only models

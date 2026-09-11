@@ -1,6 +1,6 @@
 {
   "name": "tinky-vision-mcp",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "MCP bridge for controlling legacy macOS apps via vision + accessibility. Lets Claude Desktop / Claude Code / any MCP client see + click + type in any app that doesn't natively speak MCP.",
   "type": "module",
   "bin": {
@@ -8,8 +8,9 @@
   },
   "scripts": {
     "build:helper": "cd swift-helper && swift build -c release && cp .build/release/tinky-os ../bin/tinky-os",
+    "build:scoped-helper": "node scripts/stage-scoped-helper.mjs",
     "start": "node src/server.mjs",
-    "test": "node --test tests/server.test.mjs"
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"
@@ -24,5 +25,18 @@
     "node": ">=20"
   },
   "license": "MIT",
-  "files": ["src/", "bin/", "README.md"]
+  "files": [
+    "src/",
+    "bin/",
+    "README.md"
+  ],
+  "author": "Luke Kist / TinkyBink",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgewellEPM/tinky-vision-mcp.git"
+  },
+  "homepage": "https://github.com/AgewellEPM/tinky-vision-mcp",
+  "bugs": {
+    "url": "https://github.com/AgewellEPM/tinky-vision-mcp/issues"
+  }
 }

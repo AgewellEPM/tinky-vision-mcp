@@ -18,6 +18,12 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import {
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  rmSync, unlinkSync, writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER = resolve(__dirname, '..', 'src', 'server.mjs');
@@ -90,24 +96,439 @@ function toolResult(resp) {
   try { return JSON.parse(text); } catch { return { _text: text }; }
 }
 
-test('server boots and exposes the expected 9 tools', async () => {
+test('MCPB read-only setting blocks input through its environment setting', async () => {
+  await withServer({env: {TINKY_READ_ONLY: 'true', TINKY_AUDIT_DISABLE: '1'}}, async ({call}) => {
+    const response = await call(2, 'tools/call', {name: 'os_click', arguments: {
+      x: 1, y: 1, target: 'fixture', description: 'fixture input must be blocked',
+    }});
+    assert.equal(response.result.isError, true);
+    assert.match(response.result.content[0].text, /read.only/i);
+  });
+});
+
+test('server boots and exposes the expected legacy and scoped AX tools', async () => {
   await withServer({}, async ({ call, initialize }) => {
-    assert.equal(initialize?.result?.serverInfo?.version, '0.1.4');
+    assert.equal(initialize?.result?.serverInfo?.version, '0.2.0');
     const list = await call(2, 'tools/list');
     const tools = list?.result?.tools ?? [];
     const names = tools.map(t => t.name).sort();
     assert.deepEqual(names, [
       'os_ax_check',
+      'os_ax_enroll',
+      'os_ax_press',
+      'os_ax_release',
+      'os_ax_snapshot',
+      'os_ax_targets',
       'os_click',
       'os_find_window',
       'os_focused_window',
       'os_key',
       'os_list_apps',
       'os_screenshot',
+      'os_screenshot_image',
       'os_type',
+      'portal_remote_begin',
+      'portal_remote_control',
+      'portal_remote_files',
+      'portal_remote_release',
+      'portal_remote_status',
+      'portal_snapshot',
+      'portal_state',
       'vision_find_text',
     ]);
+    for (const tool of tools) {
+      assert.ok(tool.title);
+      assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');
+      assert.equal(typeof tool.annotations.destructiveHint, 'boolean');
+    }
+    assert.equal(tools.find(t => t.name === 'os_click').annotations.readOnlyHint, false);
+    assert.equal(tools.find(t => t.name === 'os_ax_release').annotations.readOnlyHint, false);
+    const snapshot = tools.find(tool => tool.name === 'portal_snapshot');
+    assert.deepEqual(snapshot.inputSchema.properties.lane.enum, ['composed', 'full']);
   });
+});
+
+function makeFakePortalControlHost(streamDir) {
+  const root = resolve(streamDir, 'portal-control');
+  const requests = resolve(root, 'requests');
+  const responses = resolve(root, 'responses');
+  mkdirSync(requests, { recursive: true, mode: 0o700 });
+  mkdirSync(responses, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  chmodSync(requests, 0o700);
+  chmodSync(responses, 0o700);
+  const token = 'a'.repeat(64);
+  const tokenPath = resolve(root, '.session-token');
+  writeFileSync(tokenPath, token, { mode: 0o600 });
+  chmodSync(tokenPath, 0o600);
+  const bindingPath = resolve(root, 'binding.json');
+  let controllerID = null;
+  let active = false;
+  const actions = [];
+
+  const publishBinding = () => {
+    writeFileSync(bindingPath, JSON.stringify({
+      schemaVersion: 1,
+      hostProcessIdentifier: process.pid,
+      sourceID: 'remote-imac',
+      sourceKind: 'remoteMac',
+      displayName: 'iMac Panel',
+      remoteAgentID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      transportSessionID: 'transport-session-a',
+      active,
+      controllerID,
+      grantedUntilMilliseconds: active ? Date.now() + 60_000 : null,
+      updatedAtMilliseconds: Date.now(),
+      lastCommandAtMilliseconds: null,
+      message: active ? 'Perslis control is active.' : 'Perslis control is released.',
+    }), { mode: 0o600 });
+    chmodSync(bindingPath, 0o600);
+  };
+  publishBinding();
+
+  const timer = setInterval(() => {
+    for (const file of readdirSync(requests).filter(name => name.endsWith('.json'))) {
+      const path = resolve(requests, file);
+      let command;
+      try { command = JSON.parse(readFileSync(path, 'utf8')); }
+      catch { continue; }
+      actions.push(command);
+      let ok = command.token === token &&
+        command.sourceID === 'remote-imac' &&
+        command.transportSessionID === 'transport-session-a';
+      let message = 'ok';
+      if (ok && command.action === 'begin') {
+        controllerID = command.controllerID;
+        active = true;
+        publishBinding();
+      } else if (ok && command.action === 'release') {
+        controllerID = null;
+        active = false;
+        publishBinding();
+      } else if (ok && command.controllerID !== controllerID) {
+        ok = false;
+        message = 'controller mismatch';
+      }
+      const response = {
+        schemaVersion: 1,
+        commandID: command.commandID,
+        ok,
+        completedAtMilliseconds: Date.now(),
+        message,
+        localPath: command.action === 'receiveFile' ? '/tmp/incoming/demo.png' : null,
+      };
+      const responsePath = resolve(responses, file);
+      writeFileSync(responsePath, JSON.stringify(response), { mode: 0o600 });
+      chmodSync(responsePath, 0o600);
+      try { unlinkSync(path); } catch { /* MCP may remove the exact request */ }
+    }
+  }, 10);
+
+  return {
+    actions,
+    bindingPath,
+    stop() { clearInterval(timer); },
+  };
+}
+
+test('portal remote MCP grant, control, files, and release stay session-bound', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-control-test-'));
+  const host = makeFakePortalControlHost(streamDir);
+  try {
+    await withServer({
+      env: {
+        TINKY_STREAM_DIR: streamDir,
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+        TINKY_AUDIT_DISABLE: '1',
+      },
+    }, async ({ call }) => {
+      const status = toolResult(await call(2, 'tools/call', {
+        name: 'portal_remote_status', arguments: {},
+      }));
+      assert.equal(status.sourceID, 'remote-imac');
+      assert.equal(status.active, false);
+
+      const begin = toolResult(await call(3, 'tools/call', {
+        name: 'portal_remote_begin',
+        arguments: { durationSeconds: 60, description: 'Open one test document.' },
+      }));
+      assert.equal(begin.binding.active, true);
+      assert.equal(begin.binding.observation.controllerMatches, true);
+
+      const control = await call(4, 'tools/call', {
+        name: 'portal_remote_control',
+        arguments: { action: 'click', x: 120, y: 240, description: 'Select the document.' },
+      });
+      assert.equal(control?.result?.isError, undefined);
+
+      const send = await call(5, 'tools/call', {
+        name: 'portal_remote_files',
+        arguments: {
+          mode: 'send', paths: ['/tmp/demo.png'],
+          description: 'Send the test image to the paired iMac.',
+        },
+      });
+      assert.equal(send?.result?.isError, undefined);
+
+      const receive = toolResult(await call(6, 'tools/call', {
+        name: 'portal_remote_files',
+        arguments: {
+          mode: 'receive', name: 'demo.png',
+          description: 'Receive the test image from the paired iMac.',
+        },
+      }));
+      assert.equal(receive.localPath, '/tmp/incoming/demo.png');
+
+      const release = toolResult(await call(7, 'tools/call', {
+        name: 'portal_remote_release', arguments: {},
+      }));
+      assert.equal(release.binding.active, false);
+    });
+    assert.deepEqual(host.actions.map(command => command.action), [
+      'begin', 'click', 'sendFiles', 'receiveFile', 'release',
+    ]);
+    assert.equal(new Set(host.actions.map(command => command.transportSessionID)).size, 1);
+  } finally {
+    host.stop();
+    rmSync(streamDir, { recursive: true, force: true });
+  }
+});
+
+test('portal remote release remains available in read-only mode', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-release-test-'));
+  const host = makeFakePortalControlHost(streamDir);
+  try {
+    await withServer({
+      args: ['--read-only'],
+      env: {
+        TINKY_STREAM_DIR: streamDir,
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+        TINKY_AUDIT_DISABLE: '1',
+      },
+    }, async ({ call }) => {
+      const begin = await call(2, 'tools/call', {
+        name: 'portal_remote_begin',
+        arguments: { description: 'Must be denied.' },
+      });
+      assert.equal(begin?.result?.isError, true);
+      assert.match(begin?.result?.content?.[0]?.text || '', /read-only/i);
+      const release = await call(3, 'tools/call', {
+        name: 'portal_remote_release', arguments: {},
+      });
+      assert.equal(release?.result?.isError, undefined);
+    });
+    assert.deepEqual(host.actions.map(command => command.action), ['release']);
+  } finally {
+    host.stop();
+    rmSync(streamDir, { recursive: true, force: true });
+  }
+});
+
+test('stale physical Mac binding is observable but cannot request consent or control', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-stale-control-test-'));
+  const host = makeFakePortalControlHost(streamDir);
+  try {
+    const stale = JSON.parse(readFileSync(host.bindingPath, 'utf8'));
+    stale.updatedAtMilliseconds = Date.now() - 60_000;
+    stale.message = 'Remote Mac connected; Perslis control is released.';
+    writeFileSync(host.bindingPath, JSON.stringify(stale), { mode: 0o600 });
+    chmodSync(host.bindingPath, 0o600);
+
+    await withServer({
+      env: {
+        TINKY_STREAM_DIR: streamDir,
+        TINKY_AUTO_APPROVE: '1',
+        TINKY_FAKE_FOCUSED_BUNDLE: 'com.apple.Safari',
+        TINKY_AUDIT_DISABLE: '1',
+      },
+    }, async ({ call }) => {
+      const status = toolResult(await call(2, 'tools/call', {
+        name: 'portal_remote_status', arguments: {},
+      }));
+      assert.equal(status.observation.fresh, false);
+      assert.equal(status.observation.available, false);
+      assert.match(status.message, /offline or stale/i);
+      assert.match(status.hostMessage, /connected/i);
+
+      const begin = await call(3, 'tools/call', {
+        name: 'portal_remote_begin',
+        arguments: { durationSeconds: 60, description: 'Must not reach consent.' },
+      });
+      assert.equal(begin?.result?.isError, true);
+      assert.match(begin?.result?.content?.[0]?.text || '', /offline|stale/i);
+    });
+    assert.deepEqual(host.actions, []);
+  } finally {
+    host.stop();
+    rmSync(streamDir, { recursive: true, force: true });
+  }
+});
+
+test('portal_state and portal_snapshot expose verified composed vision', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-portal-test-'));
+  const image = Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0xff, 0xd9]);
+  const sha256 = createHash('sha256').update(image).digest('hex');
+  const now = new Date().toISOString();
+  const state = {
+    schemaVersion: 1,
+    session: {
+      sourceID: 'isolated-preview', kind: 'isolatedApplication',
+      displayName: 'Preview', hostName: null, applicationBundleIdentifier: 'com.apple.Preview',
+      processIdentifier: 123, virtualMachineIdentifier: null,
+      capabilities: ['pointer', 'keyboard'],
+    },
+    health: {
+      sourceID: 'isolated-preview', lifecycle: 'streaming', observedAt: now,
+      lastHeartbeatAt: now, lastFrameAt: now, lastFrameSequence: 42,
+      consecutiveFrameFailures: 0, droppedFrameCount: 0,
+      roundTripMilliseconds: null, message: null,
+    },
+    focus: {
+      owner: 'portal', portalSourceID: 'isolated-preview',
+      cursorInPortal: true, keyboardCaptured: true,
+    },
+    input: {
+      lastEventSequence: 9, lastEventAt: now, lastEventKind: 'pointerMove',
+      pointer: { x: 12, y: 34 }, pressedButtons: [], pressedKeyCodes: [], modifiers: [],
+    },
+    vision: {
+      portalLatestPath: resolve(streamDir, 'portal-latest.jpg'),
+      composedLatestPath: resolve(streamDir, 'composed-latest.jpg'),
+      statePath: resolve(streamDir, 'portal-state.json'),
+      publishedFrameSequence: 42, publishedAt: now, heartbeatAt: now,
+    },
+  };
+  const record = {
+    schemaVersion: 1, lane: 'composed', publishedAt: now,
+    jpegPath: resolve(streamDir, 'composed-latest.jpg'),
+    jpegSHA256: sha256, jpegBytes: image.length,
+    frame: {
+      sourceID: 'composed:isolated-preview', sequence: 42, capturedAt: now,
+      sourceSize: { width: 3440, height: 1440 }, colorSpace: 'sRGB', cursorEmbedded: true,
+    },
+  };
+  writeFileSync(resolve(streamDir, 'portal-state.json'), JSON.stringify(state));
+  writeFileSync(resolve(streamDir, 'portal-handoff.json'), JSON.stringify({
+    schemaVersion: 1,
+    phase: 'portalActive',
+    updatedAt: now,
+    truthProcessIdentifier: null,
+    portalProcessIdentifier: 456,
+    message: 'Portal compositor and Tinky visibility are healthy.',
+  }));
+  writeFileSync(resolve(streamDir, 'composed-frame.json'), JSON.stringify(record));
+  writeFileSync(resolve(streamDir, 'composed-latest.jpg'), image);
+
+  try {
+    await withServer({ env: { TINKY_STREAM_DIR: streamDir } }, async ({ call }) => {
+      const stateResponse = await call(2, 'tools/call', {
+        name: 'portal_state', arguments: {},
+      });
+      const stateResult = toolResult(stateResponse);
+      assert.equal(stateResult.session.sourceID, 'isolated-preview');
+      assert.equal(stateResult.focus.owner, 'portal');
+      assert.equal(stateResult.handoff.phase, 'portalActive');
+      assert.equal(typeof stateResult.observation.handoff.fileAgeMs, 'number');
+      assert.equal(typeof stateResult.observation.heartbeatAgeMs, 'number');
+      assert.deepEqual(stateResult.vision.availableLanes, ['composed']);
+      assert.equal('portalLatestPath' in stateResult.vision, false);
+
+      const snapshot = await call(3, 'tools/call', {
+        name: 'portal_snapshot', arguments: { lane: 'composed' },
+      });
+      const content = snapshot?.result?.content ?? [];
+      assert.equal(content.length, 2);
+      const summary = JSON.parse(content[0].text);
+      assert.equal(summary.imageSHA256, sha256);
+      assert.equal(summary.portal.input.pointer.x, 12);
+      assert.equal(content[1].type, 'image');
+      assert.equal(content[1].mimeType, 'image/jpeg');
+      assert.equal(Buffer.from(content[1].data, 'base64').toString('hex'), image.toString('hex'));
+    });
+  } finally {
+    rmSync(streamDir, { recursive: true, force: true });
+  }
+});
+
+test('portal_state exposes handoff recovery even before portal state exists', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-handoff-only-test-'));
+  const now = new Date().toISOString();
+  writeFileSync(resolve(streamDir, 'portal-handoff.json'), JSON.stringify({
+    schemaVersion: 1,
+    phase: 'restoringTruth',
+    updatedAt: now,
+    truthProcessIdentifier: null,
+    portalProcessIdentifier: null,
+    message: 'Restoring the frozen left workspace.',
+  }));
+
+  try {
+    await withServer({ env: { TINKY_STREAM_DIR: streamDir } }, async ({ call }) => {
+      const response = await call(2, 'tools/call', {
+        name: 'portal_state', arguments: {},
+      });
+      const result = toolResult(response);
+      assert.equal(result.session, null);
+      assert.equal(result.handoff.phase, 'restoringTruth');
+      assert.match(result.observation.stateUnavailable, /unavailable/i);
+    });
+  } finally {
+    rmSync(streamDir, { recursive: true, force: true });
+  }
+});
+
+test('portal_snapshot rejects the nonexistent portal-only lane', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-portal-mismatch-'));
+  const now = new Date().toISOString();
+  writeFileSync(resolve(streamDir, 'portal-state.json'), JSON.stringify({
+    schemaVersion: 1,
+    session: null,
+    health: null,
+    focus: { owner: 'leftWorkspace', portalSourceID: null, cursorInPortal: false, keyboardCaptured: false },
+    input: { lastEventSequence: null, lastEventAt: null, lastEventKind: null, pointer: null, pressedButtons: [], pressedKeyCodes: [], modifiers: [] },
+    vision: { portalLatestPath: '', composedLatestPath: '', statePath: '', publishedFrameSequence: null, publishedAt: null, heartbeatAt: now },
+  }));
+  try {
+    await withServer({ env: { TINKY_STREAM_DIR: streamDir } }, async ({ call }) => {
+      const response = await call(2, 'tools/call', {
+        name: 'portal_snapshot', arguments: { lane: 'portal' },
+      });
+      assert.equal(response?.result?.isError, true);
+      assert.match(response?.result?.content?.[0]?.text || '', /invalid portal lane/i);
+    });
+  } finally {
+    rmSync(streamDir, { recursive: true, force: true });
+  }
+});
+
+test('portal_snapshot fails closed when composed image and metadata hashes differ', async () => {
+  const streamDir = mkdtempSync(resolve(tmpdir(), 'tinky-composed-mismatch-'));
+  const now = new Date().toISOString();
+  writeFileSync(resolve(streamDir, 'portal-state.json'), JSON.stringify({
+    schemaVersion: 1,
+    session: null,
+    health: null,
+    focus: { owner: 'leftWorkspace', portalSourceID: null, cursorInPortal: false, keyboardCaptured: false },
+    input: { lastEventSequence: null, lastEventAt: null, lastEventKind: null, pointer: null, pressedButtons: [], pressedKeyCodes: [], modifiers: [] },
+    vision: { composedLatestPath: '', statePath: '', publishedFrameSequence: null, publishedAt: null, heartbeatAt: now },
+  }));
+  writeFileSync(resolve(streamDir, 'composed-frame.json'), JSON.stringify({
+    schemaVersion: 1, lane: 'composed', jpegSHA256: '0'.repeat(64),
+  }));
+  writeFileSync(resolve(streamDir, 'composed-latest.jpg'), Buffer.from('different'));
+  try {
+    await withServer({ env: { TINKY_STREAM_DIR: streamDir } }, async ({ call }) => {
+      const response = await call(2, 'tools/call', {
+        name: 'portal_snapshot', arguments: { lane: 'composed' },
+      });
+      assert.equal(response?.result?.isError, true);
+      assert.match(response?.result?.content?.[0]?.text || '', /does not match/i);
+    });
+  } finally {
+    rmSync(streamDir, { recursive: true, force: true });
+  }
 });
 
 test('read-only mode blocks os_click but allows os_screenshot', async () => {
@@ -412,4 +833,25 @@ test('SEC: audit log redacts os_type "text" payload (Codex HIGH#1)', async () =>
   } finally {
     rmSync(auditDir, { recursive: true, force: true });
   }
+});
+
+
+test('MCP screenshot image carries validated PNG bytes and preserves read-only mode', async () => {
+  const root = mkdtempSync(resolve(tmpdir(), 'tinky-mcp-image-'));
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4t8AAAAASUVORK5CYII=', 'base64');
+  const path = resolve(root, 'frame.png'), helper = resolve(root, 'helper.mjs');
+  writeFileSync(path, png, { mode: 0o600 });
+  writeFileSync(helper, '#!/usr/bin/env node\nconsole.log(JSON.stringify(' + JSON.stringify({ok:true,path}) + '));\n', { mode: 0o700 });
+  try {
+    await withServer({ args:['--read-only'], env: { TINKY_HELPER_BIN:helper, TINKY_AUDIT_DISABLE:'1' } }, async ({call}) => {
+      const result = await call(2, 'tools/call', {name:'os_screenshot_image',arguments:{}});
+      assert.equal(result.result.isError, undefined);
+      const image = result.result.content.find(c => c.type === 'image');
+      assert.equal(image.mimeType, 'image/png');
+      assert.deepEqual(Buffer.from(image.data, 'base64'), png);
+      writeFileSync(path, 'not an image');
+      const rejected = await call(3, 'tools/call', {name:'os_screenshot_image',arguments:{}});
+      assert.equal(rejected.result.isError, true);
+    });
+  } finally { rmSync(root, {recursive:true,force:true}); }
 });

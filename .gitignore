@@ -8,3 +8,7 @@ bin/tinky-os-ax
 
 # Built app bundle (produced by build-tinkystream-app.sh)
 swift-helper/TinkyStream.app/
+
+# scoped-ax lane build/staging artifacts (binaries live on wip branch source)
+bin/
+.scoped-ax-staging/

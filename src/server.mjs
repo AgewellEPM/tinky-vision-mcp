@@ -68,6 +68,7 @@ import {
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { STREAM_TOOLS, portalState, portalSnapshot } from './stream-vision.mjs';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -555,7 +556,7 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
+  tools: [...TOOLS, ...STREAM_TOOLS],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -564,6 +565,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     let result;
     switch (name) {
+      case 'portal_state':
+        result = portalState();
+        break;
+      case 'portal_snapshot':
+        result = portalSnapshot(args.lane ?? 'full');
+        break;
       case 'os_screenshot': {
         const argv = [];
         if (args.bundleId) argv.push('--app', args.bundleId);

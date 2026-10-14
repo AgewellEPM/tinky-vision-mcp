@@ -247,3 +247,25 @@ canonical repo's `post-commit`/`post-merge` hooks auto-run `tinky-vision-sync`,
 which copies the git-tracked files canonical → running (binaries in `bin/` and
 `node_modules/` are never touched). Manual: `tinky-vision-sync` to redeploy,
 `tinky-vision-sync check` to detect drift (exit 1 if any).
+
+## Local stream and isolated-session recovery
+
+`portal_state` reports full, see-through and composed stream freshness separately.
+`portal_snapshot` defaults to the live physical `full` lane and returns a frozen,
+private local image path for OCR. A stale GhostBridge portal cannot block the
+physical feed. Composed snapshots require matching image hashes and a recent
+original capture timestamp; stale footage is refused. These tools run locally.
+
+For an isolated app, use IsolatedTester `session_frame` and its session-scoped
+input tools. Send that exact image path to `vision_find_text`; desktop image
+coordinates and accessibility/global coordinates are different spaces. Stop the
+session to finalize its local H.264 `session.mp4`, then verify the app exited.
+These native sessions share the macOS login; they are not security-isolated VMs.
+
+Deployment now uses `scripts/sync-installed.py` through `~/bin/tinky-vision-sync`.
+A reviewed `.tinky-sync-state.json` in the installed directory pins the source
+branch and last-deployed file hashes. A branch switch, uncommitted source, or
+installed edits causes a refusal before copying. Unrelated installed files and
+helper binaries are preserved. Reconcile differences before updating the baseline;
+never run an unconditional copy over another session's work. Reconnect existing
+MCP clients to discover newly added tools.

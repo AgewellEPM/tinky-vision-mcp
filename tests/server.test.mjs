@@ -90,7 +90,7 @@ function toolResult(resp) {
   try { return JSON.parse(text); } catch { return { _text: text }; }
 }
 
-test('server boots and exposes the expected 9 tools', async () => {
+test('server boots and exposes host control plus stream observations', async () => {
   await withServer({}, async ({ call, initialize }) => {
     assert.equal(initialize?.result?.serverInfo?.version, '0.1.4');
     const list = await call(2, 'tools/list');
@@ -105,6 +105,8 @@ test('server boots and exposes the expected 9 tools', async () => {
       'os_list_apps',
       'os_screenshot',
       'os_type',
+      'portal_snapshot',
+      'portal_state',
       'vision_find_text',
     ]);
   });

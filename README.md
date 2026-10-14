@@ -1,5 +1,46 @@
 # tinky-vision-mcp
 
+## Combined IsolatedTester system
+
+`node src/isolated-system.mjs` is one local MCP entrypoint for **IsolatedTester,
+TinkyVision and TinkyStream**. It initializes the installed native `isolated-mcp`
+and this repository's vision backend internally, and ensures the existing shared
+TinkyStream LaunchAgent is running. Clients register this entrypoint once; they
+do not also need the standalone vision MCP. The current inventory is 45 tools.
+
+The stream is reused across connections, never duplicated or restarted with
+`kickstart -k`. Before starting it, the gateway requires the installed app and
+≤1 FPS full/see-through capture with a 300-frame ring. Missing dependencies or
+startup failures are reported instead of advertising a partial system.
+
+- `create_session` creates the local virtual monitor/app and starts the existing
+  session recording loop, with combined vision/stream availability in its result.
+- `observe_session(sessionId)` returns a fresh session frame, TinkyVision OCR of
+  that exact image, recording status and shared-stream health in one call.
+- `vision_find_text`, `os_screenshot`, `os_click`, `os_type` and `os_key` accept
+  `sessionId`. The native session handles the targeted capture/input; click
+  coordinates are relative to its window image. A bad session never falls back
+  to the host desktop. Scoped double-click is refused because the native MCP
+  does not expose it.
+- Without `sessionId`, those tools retain their existing host behavior and
+  TinkyVision consent/deny gates. Native session calls retain native authorization
+  and action receipts. `--read-only` blocks both native and host write routes.
+- `stream_status` reports the shared TinkyStream process and lane freshness.
+  `portal_snapshot` remains a physical/composed observation. The isolated app's
+  stream is its session frame/history; the physical desktop feed is not relabeled
+  as the isolated monitor.
+
+The existing native resources, recording controls, receipts and video tools are
+forwarded. On client disconnect the gateway stops/finalizes only its own native
+sessions and closes its two children. The shared TinkyStream service stays available
+for other users/clients. Keep a workspace session connected while its virtual
+monitor needs to remain visible in macOS Displays.
+
+Requires the signed native IsolatedTester binaries, this repo's installed helper
+and Node dependencies, and `~/Library/LaunchAgents/com.tinky.tinkystream.plist`.
+`TINKY_ISOLATED_BIN` may choose another installed native backend. No browser or
+cloud provider is needed for capture, local OCR, input and recording.
+
 **v0.1.1 — PILOT-READY for vision + non-sensitive automation. Treat
 it like sudo for your screen.**
 

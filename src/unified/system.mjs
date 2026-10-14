@@ -12,6 +12,8 @@ const directory = dirname(fileURLToPath(import.meta.url));
 const sessionProperty = { type: 'string', minLength: 1,
   description: 'IsolatedTester session ID. Targets that app and uses window-image coordinates; omit only for deliberate host-desktop operations.' };
 const scopedNames = new Set(['os_screenshot', 'os_click', 'os_type', 'os_key', 'vision_find_text']);
+const hostReadOnlyNames = new Set(['os_screenshot', 'os_list_apps', 'os_find_window',
+  'os_focused_window', 'os_ax_check', 'vision_find_text', 'portal_state', 'portal_snapshot']);
 
 export const EXTRA_TOOLS = [
   { name: 'observe_session', description: 'Observe an isolated app with one call: fresh IsolatedTester frame, TinkyVision local OCR of that exact frame, recording status and TinkyStream health. No cloud provider.',
@@ -23,7 +25,11 @@ export const EXTRA_TOOLS = [
 ];
 
 export function combinedTools(isolated, vision) {
-  const tools = [...isolated, ...vision.map(tool => {
+  const tools = [...isolated, ...vision.map(original => {
+    // The legacy Tinky tools predate MCP annotations. Mark their established
+    // read-only behavior so combined read-only mode and client approvals agree.
+    const tool = { ...original, annotations: { ...original.annotations,
+      readOnlyHint: hostReadOnlyNames.has(original.name), openWorldHint: false } };
     if (!scopedNames.has(tool.name)) return tool;
     const inputSchema = { ...tool.inputSchema,
       properties: { ...tool.inputSchema.properties, sessionId: sessionProperty } };

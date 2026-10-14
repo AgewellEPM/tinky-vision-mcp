@@ -131,4 +131,6 @@ test('combined inventory rejects collisions and setup identifies all components'
   assert.equal(setup.unified, true);
   assert.equal(setup.toolCount, fixture.system.tools.length);
   assert.equal(setup.components.tinkyStream.running, true);
+  const legacyRead = { name: 'vision_find_text', inputSchema: { type: 'object', properties: {} } };
+  assert.equal(combinedTools([], [legacyRead])[0].annotations.readOnlyHint, true);
 });

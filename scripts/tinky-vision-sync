@@ -1,0 +1,3 @@
+#!/bin/sh
+# Committed-source deploy with a reviewed per-file baseline; never overwrite drift.
+exec /usr/bin/python3 "$HOME/tinky-vision-mcp/scripts/sync-installed.py" "$@"

@@ -4,12 +4,13 @@ import { StreamService } from '../src/unified/stream-service.mjs';
 import { UnifiedSystem, combinedTools } from '../src/unified/system.mjs';
 import { jsonResult, value } from '../src/unified/backend.mjs';
 
-function streamFixture({ loaded = true, running = true, fps = '1', lookupError } = {}) {
+function streamFixture({ loaded = true, running = true, fps = '1', lookupError, disabled = false } = {}) {
   const calls = [];
   const config = { Label: 'com.tinky.tinkystream',
     ProgramArguments: ['/fixture/Applications/TinkyStream.app/Contents/MacOS/TinkyStream'],
     EnvironmentVariables: { TINKY_STREAM_FPS: fps, TINKY_STREAM_SEETHROUGH_FPS: '1', TINKY_STREAM_RING: '300' } };
   const service = new StreamService({ home: '/fixture', uid: 123,
+    exists: () => disabled,
     observe: () => ({ lanes: { full: { fresh: true } }, observedAt: 'fixture' }),
     invoke: async (command, args) => {
       calls.push({ command, args });
@@ -50,6 +51,19 @@ test('unsafe capture rates or inaccessible launchd fail before starting a produc
   const inaccessible = streamFixture({ lookupError: 'Operation not permitted' });
   await assert.rejects(inaccessible.service.ensureRunning(), /Operation not permitted/);
   assert.equal(inaccessible.calls.filter(call => call.args[0] === 'bootstrap').length, 0);
+});
+
+test('manual off survives fresh connections and status calls without starting capture', async () => {
+  for (let connection = 0; connection < 2; connection++) {
+    const { service, calls } = streamFixture({ loaded: false, running: false, disabled: true });
+    for (let status = 0; status < 2; status++) {
+      const result = await service.ensureRunning();
+      assert.equal(result.manuallyDisabled, true);
+      assert.equal(result.running, false);
+      assert.equal(result.captureFresh, false);
+    }
+    assert.deepEqual(calls.map(call => call.args[0]), ['print', 'print']);
+  }
 });
 
 function systemFixture(readOnly = false) {

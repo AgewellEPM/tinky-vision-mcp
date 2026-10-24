@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { portalState } from '../stream-vision.mjs';
 
 const execute = promisify(execFile);
@@ -11,12 +12,13 @@ const run = async (command, args) => (await execute(command, args, { timeout: 10
 // MCP connection. Reuse it, start it if absent, never restart/stop a borrowed
 // producer, and enforce Luke's capture limits before launching anything.
 export class StreamService {
-  constructor({ invoke = run, home = homedir(), uid = process.getuid(), observe = portalState } = {}) {
+  constructor({ invoke = run, home = homedir(), uid = process.getuid(), observe = portalState, exists = existsSync } = {}) {
     this.invoke = invoke;
     this.plist = join(home, 'Library/LaunchAgents/com.tinky.tinkystream.plist');
     this.executable = join(home, 'Applications/TinkyStream.app/Contents/MacOS/TinkyStream');
     this.label = `gui/${uid}/com.tinky.tinkystream`;
     this.observe = observe;
+    this.manuallyDisabled = () => exists(join(home, '.kist/tinkystream.disabled'));
   }
 
   async configuration() {
@@ -52,6 +54,12 @@ export class StreamService {
   }
 
   async ensureOnce() {
+    if (this.manuallyDisabled()) {
+      const state = await this.inspect();
+      return { ...state, manuallyDisabled: true, started: false, shared: true,
+        captureFresh: false, source: 'physical-display',
+        note: 'TinkyStream is turned off by the user. Run tinkystream on to resume desktop capture.' };
+    }
     const limits = await this.configuration();
     let state = await this.inspect();
     let started = false;

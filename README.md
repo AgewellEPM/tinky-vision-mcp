@@ -26,6 +26,9 @@ startup failures are reported instead of advertising a partial system.
   TinkyVision consent/deny gates. Native session calls retain native authorization
   and action receipts. `--read-only` blocks both native and host write routes.
 - `stream_status` reports the shared TinkyStream process and lane freshness.
+  A persistent `~/.kist/tinkystream.disabled` marker means capture was manually
+  turned off; gateway startup and status calls respect it and keep other tools
+  available. Use the installed `tinkystream on` control to resume capture.
   `portal_snapshot` remains a physical/composed observation. The isolated app's
   stream is its session frame/history; the physical desktop feed is not relabeled
   as the isolated monitor.

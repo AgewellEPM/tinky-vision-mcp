@@ -127,11 +127,21 @@ test('invalid/missing sessions and unsupported double-click never become host ac
   assert.equal(calls.some(call => call.backend === 'vision'), false);
 });
 
-test('unscoped host tools preserve their consent/deny result and read-only blocks both input routes', async () => {
+test('missing session never reaches host input, including a claimed target and description', async () => {
   const fixture = systemFixture();
-  const args = { x: 10, y: 20, target: 'sensitive', description: 'blocked' };
-  assert.equal((await fixture.system.call('os_click', args)).isError, true);
-  assert.deepEqual(fixture.calls, [{ backend: 'vision', name: 'os_click', args }]);
+  for (const name of ['os_click', 'os_type', 'os_key']) {
+    for (const args of [{}, { target: 'Perslis', description: 'travel', x: 10, y: 20, text: 'go', key: 'w' }]) {
+      await assert.rejects(fixture.system.call(name, args), /nonempty sessionId/);
+    }
+    const tool = fixture.system.tools.find(tool => tool.name === name);
+    assert.ok(tool.inputSchema.required.includes('sessionId'));
+    assert.equal(tool.inputSchema.anyOf, undefined);
+  }
+  assert.deepEqual(fixture.calls, []);
+  assert.equal(fixture.starts(), 0);
+});
+
+test('read-only blocks isolated input routes', async () => {
   const readOnly = systemFixture(true);
   await assert.rejects(readOnly.system.call('os_click', { sessionId: 'owned', x: 1, y: 2 }), /read-only/);
   await assert.rejects(readOnly.system.call('type_text', { sessionId: 'owned', text: 'x' }), /read-only/);

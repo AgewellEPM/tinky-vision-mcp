@@ -10,8 +10,9 @@ import { StreamService } from './stream-service.mjs';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const sessionProperty = { type: 'string', minLength: 1,
-  description: 'IsolatedTester session ID. Targets that app and uses window-image coordinates; omit only for deliberate host-desktop operations.' };
+  description: 'IsolatedTester session ID returned by create_session. Input targets only that app on its virtual monitor; coordinates are relative to the session image.' };
 const scopedNames = new Set(['os_screenshot', 'os_click', 'os_type', 'os_key', 'vision_find_text']);
+const inputNames = new Set(['os_click', 'os_type', 'os_key']);
 const hostReadOnlyNames = new Set(['os_screenshot', 'os_list_apps', 'os_find_window',
   'os_focused_window', 'os_ax_check', 'vision_find_text', 'portal_state', 'portal_snapshot']);
 
@@ -33,15 +34,17 @@ export function combinedTools(isolated, vision) {
     if (!scopedNames.has(tool.name)) return tool;
     const inputSchema = { ...tool.inputSchema,
       properties: { ...tool.inputSchema.properties, sessionId: sessionProperty } };
-    // Session input is already authorized through the existing native tools.
-    // Unscoped host writes still require Tinky's target/description and gates.
-    if (['os_click', 'os_type', 'os_key'].includes(tool.name)) {
+    // This MCP is the isolated workspace. Missing scope must never select
+    // Tinky's host input backend, even if target/description were supplied.
+    if (inputNames.has(tool.name)) {
       const required = inputSchema.required || [];
-      inputSchema.required = required.filter(key => !['target', 'description'].includes(key));
-      inputSchema.anyOf = [{ required: ['sessionId'] }, { required: ['target', 'description'] }];
+      inputSchema.required = [...new Set([...required.filter(key => !['target', 'description'].includes(key)), 'sessionId'])];
+      delete inputSchema.anyOf;
     }
     return { ...tool, inputSchema,
-      description: `${tool.description} In this combined MCP, pass sessionId for the isolated app; otherwise the original host behavior and consent gates apply.` };
+      description: inputNames.has(tool.name)
+        ? `Control only an isolated app via ${tool.name}. Requires sessionId from create_session; never controls the user's desktop or needs the app in front. Click coordinates use session image pixels. Use observe_session to verify the result.`
+        : `${tool.description} Pass sessionId to observe the isolated app; host observations do not establish isolated app state.` };
   }), ...EXTRA_TOOLS];
   if (new Set(tools.map(tool => tool.name)).size !== tools.length) throw new Error('Combined MCP tool names collide');
   return tools;
@@ -60,6 +63,7 @@ export class UnifiedSystem {
     const tool = this.tools.find(tool => tool.name === name);
     if (!tool) throw new Error(`Unknown tool: ${name}`);
     if (this.readOnly && tool.annotations?.readOnlyHint !== true) throw new Error('Unified MCP is read-only');
+    if (inputNames.has(name)) this.sessionId(args);
     if (!this.isolated.ready || !this.vision.ready) throw new Error('A combined MCP backend disconnected; reconnect the server');
     const stream = await this.stream.ensureRunning();
     if (name === 'stream_status') return jsonResult(stream);
@@ -71,7 +75,7 @@ export class UnifiedSystem {
       return jsonResult({ sessionId, frame, vision, recording, tinkyStream: stream,
         coordinateSpace: 'isolated-window-image' });
     }
-    if (scopedNames.has(name) && Object.hasOwn(args, 'sessionId')) {
+    if (inputNames.has(name) || (scopedNames.has(name) && Object.hasOwn(args, 'sessionId'))) {
       return this.callScoped(name, args);
     }
     const result = await this.routes.get(name).call(name, args);

@@ -22,9 +22,11 @@ startup failures are reported instead of advertising a partial system.
   coordinates are relative to its window image. A bad session never falls back
   to the host desktop. Scoped double-click is refused because the native MCP
   does not expose it.
-- Without `sessionId`, those tools retain their existing host behavior and
-  TinkyVision consent/deny gates. Native session calls retain native authorization
-  and action receipts. `--read-only` blocks both native and host write routes.
+- `os_click`, `os_type` and `os_key` require `sessionId` in both the schema and
+  runtime. Missing scope is refused before either backend runs, even with a
+  claimed host target. The combined MCP never dispatches host mouse/keyboard
+  input. Read-only host observations remain available. Native calls retain
+  authorization and action receipts; `--read-only` blocks writes.
 - `stream_status` reports the shared TinkyStream process and lane freshness.
   A persistent `~/.kist/tinkystream.disabled` marker means capture was manually
   turned off; gateway startup and status calls respect it and keep other tools

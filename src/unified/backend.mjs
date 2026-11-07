@@ -30,14 +30,22 @@ export class Backend {
   }
 
   async close({ stopSessions = false } = {}) {
+    let deadline;
     try {
       if (stopSessions && this.ready) {
-        const sessions = value(await this.call('list_sessions'));
-        for (const session of sessions) {
-          await this.call('stop_session', { sessionId: session.sessionId });
-        }
+        const finalize = async () => {
+          const sessions = value(await this.call('list_sessions'));
+          for (const session of sessions) {
+            await this.call('stop_session', { sessionId: session.sessionId });
+          }
+        };
+        await Promise.race([finalize(), new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(new Error(`${this.name} session cleanup timed out`)), 5000);
+          deadline.unref();
+        })]);
       }
     } finally {
+      clearTimeout(deadline);
       this.ready = false;
       await this.client.close();
     }

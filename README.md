@@ -38,7 +38,10 @@ startup failures are reported instead of advertising a partial system.
 The existing native resources, recording controls, receipts and video tools are
 forwarded. On client disconnect the gateway stops/finalizes only its own native
 sessions and closes its two children. The shared TinkyStream service stays available
-for other users/clients. Keep a workspace session connected while its virtual
+for other users/clients. Input EOF, a closed pipe and broken output all trigger the
+same cleanup, including disconnects during startup. Session finalization has a
+five-second deadline before closing the owned backend transport.
+Keep a workspace session connected while its virtual
 monitor needs to remain visible in macOS Displays.
 
 Requires the signed native IsolatedTester binaries, this repo's installed helper

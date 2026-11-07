@@ -10,7 +10,7 @@
   "scripts": {
     "build:helper": "cd swift-helper && swift build -c release && cp .build/release/tinky-os ../bin/tinky-os",
     "start": "node src/server.mjs",
-    "test": "node --test tests/server.test.mjs tests/stream-vision.test.mjs tests/unified-system.test.mjs"
+    "test": "node --test tests/server.test.mjs tests/stream-vision.test.mjs tests/unified-system.test.mjs tests/gateway-lifecycle.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"

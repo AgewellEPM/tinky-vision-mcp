@@ -131,29 +131,65 @@ function environment(prefixes) {
     ['TMPDIR', 'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM'].includes(key) || prefixes.some(prefix => key.startsWith(prefix))));
 }
 
-export async function startSystem() {
+export async function startSystem(options = {}) {
   const readOnly = process.argv.includes('--read-only');
-  const isolated = new Backend('IsolatedTester', process.env.TINKY_ISOLATED_BIN || join(homedir(), '.local/bin/isolated-mcp'), [],
+  const isolated = options.isolated ?? new Backend('IsolatedTester', process.env.TINKY_ISOLATED_BIN || join(homedir(), '.local/bin/isolated-mcp'), [],
     environment(['IST_', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY']));
-  const vision = new Backend('TinkyVision', process.execPath,
+  const vision = options.vision ?? new Backend('TinkyVision', process.execPath,
     [resolve(directory, '../server.mjs'), ...(readOnly ? ['--read-only'] : [])], environment(['TINKY_']));
-  const stream = new StreamService();
-  let server, closing;
+  const stream = options.stream ?? new StreamService();
+  const input = options.input ?? process.stdin;
+  const output = options.output ?? process.stdout;
+  if (input.readableEnded || input.destroyed) return;
+  let server, closing, startup, shuttingDown;
+  let disconnected = false;
   const close = () => {
     if (closing) return closing;
     closing = (async () => {
+      // A disconnect during startup must also close children that finish
+      // connecting after it. allSettled makes this wait bounded by startup.
+      await startup;
       // Stop and finalize only THIS connection's native sessions before EOF.
       try { await isolated.close({ stopSessions: true }); }
       finally { await vision.close(); }
-    })();
+    })().finally(() => {
+      input.off('end', shutdown);
+      input.off('close', shutdown);
+      input.off('error', shutdown);
+      output.off('error', shutdown);
+      process.off('SIGTERM', shutdown);
+      process.off('SIGINT', shutdown);
+    });
     return closing;
   };
+  const shutdown = () => {
+    disconnected = true;
+    if (shuttingDown) return shuttingDown;
+    shuttingDown = (async () => {
+      try { await close(); }
+      finally { await server?.close(); }
+    })().catch(error => {
+      console.error(`[isolated-vision-system] shutdown: ${error.message}`);
+      process.exitCode = 1;
+    });
+    return shuttingDown;
+  };
+  // The SDK's stdio server transport does not call onclose on input EOF.
+  // Child-process handles otherwise keep this gateway alive indefinitely.
+  input.once('end', shutdown);
+  input.once('close', shutdown);
+  input.once('error', shutdown);
+  output.once('error', shutdown);
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   try {
     // Startup is one operation to the MCP client. No backend is advertised as
     // available unless both initialized and the managed stream is running.
-    const results = await Promise.allSettled([isolated.connect(), vision.connect(), stream.ensureRunning()]);
+    startup = Promise.allSettled([isolated.connect(), vision.connect(), stream.ensureRunning()]);
+    const results = await startup;
     const failure = results.find(result => result.status === 'rejected');
     if (failure) throw failure.reason;
+    if (disconnected || input.readableEnded || input.destroyed) { await close(); return; }
     const system = new UnifiedSystem(isolated, vision, stream, { readOnly });
     server = new Server({ name: 'isolated-tester', version: '1.0.0-unified' },
       { capabilities: { tools: {}, resources: {} } });
@@ -164,14 +200,12 @@ export async function startSystem() {
     });
     server.setRequestHandler(ListResourcesRequestSchema, () => isolated.client.listResources());
     server.setRequestHandler(ReadResourceRequestSchema, request => isolated.client.readResource(request.params));
-    server.onclose = () => { close().catch(error => console.error(`[isolated-vision-system] cleanup: ${error.message}`)); };
-    const signal = async () => {
-      try { await close(); await server.close(); }
-      catch (error) { console.error(`[isolated-vision-system] shutdown: ${error.message}`); process.exitCode = 1; }
+    server.onclose = () => {
+      disconnected = true;
+      close().catch(error => console.error(`[isolated-vision-system] cleanup: ${error.message}`));
     };
-    process.once('SIGTERM', signal);
-    process.once('SIGINT', signal);
-    await server.connect(new StdioServerTransport());
+    await server.connect(new StdioServerTransport(input, output));
+    if (disconnected) { await shutdown(); return; }
     console.error(`[isolated-vision-system] ready: ${system.tools.length} tools, shared TinkyStream PID ${results[2].value.pid}`);
   } catch (error) {
     await close();
